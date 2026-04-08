@@ -1,0 +1,718 @@
+// ============================================================
+// SPA Router + API helper
+// ============================================================
+
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => document.querySelectorAll(sel);
+const content = $('#content');
+
+// Toast notification
+function toast(msg, type = 'success') {
+    const el = document.createElement('div');
+    el.className = `toast toast-${type}`;
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 3000);
+}
+
+// API helpers
+const configCache = {};
+
+async function apiGet(url) {
+    const res = await fetch(url);
+    return res.json();
+}
+
+async function apiGetConfig(url) {
+    if (configCache[url]) return configCache[url];
+    const data = await apiGet(url);
+    configCache[url] = data;
+    return data;
+}
+
+async function apiPost(url, data) {
+    // Xóa cache config khi lưu
+    delete configCache[url];
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+    });
+    return res.json();
+}
+
+// ============================================================
+// Page: Home
+// ============================================================
+async function pageHome() {
+    content.innerHTML = '<h2>📊 Trang chủ</h2><div class="status-grid" id="statusGrid">Đang tải...</div>';
+    try {
+        const d = await apiGet('/api/status');
+        $('#statusGrid').innerHTML = `
+            <div class="status-item"><div class="label">Uptime</div><div class="value">${formatUptime(d.uptime)}</div></div>
+            <div class="status-item"><div class="label">Free Heap</div><div class="value">${(d.free_heap/1024).toFixed(0)} KB</div></div>
+            <div class="status-item"><div class="label">WiFi</div><div class="value">${d.wifi_mode}</div></div>
+            <div class="status-item"><div class="label">IP</div><div class="value">${d.ip}</div></div>
+            <div class="status-item"><div class="label">SD Tổng</div><div class="value">${d.sd_total_mb} MB</div></div>
+            <div class="status-item"><div class="label">SD Đã dùng</div><div class="value">${d.sd_used_mb} MB</div></div>
+        `;
+    } catch(e) {
+        $('#statusGrid').innerHTML = '<p>Lỗi kết nối API</p>';
+    }
+}
+
+function formatUptime(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    return `${h}h ${m}m ${s}s`;
+}
+
+// ============================================================
+// Page: Network config (WiFiManager style)
+// ============================================================
+async function pageNetwork() {
+    const cfg = await apiGetConfig('/api/config/network');
+    content.innerHTML = `
+        <h2>🌐 Cấu hình Mạng / MQTT</h2>
+        <div class="card">
+            <h3>WiFi</h3>
+            <div class="form-group">
+                <label>SSID</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <input id="wifi_ssid" value="${cfg.wifi_ssid || ''}" style="flex:1">
+                    <button class="btn btn-primary" id="btnScan" onclick="scanWifi()">📡 Scan</button>
+                </div>
+            </div>
+            <div id="wifiList" style="display:none;margin:8px 0">
+                <div id="wifiListInner" style="max-height:200px;overflow-y:auto;border:1px solid #555;border-radius:6px;background:#2a2a4a"></div>
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <input id="wifi_pass" type="password" value="${cfg.wifi_pass || ''}" style="flex:1">
+                    <button class="btn" onclick="togglePass()" style="padding:6px 10px" title="Hiện/ẩn">👁</button>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <h3>MQTT</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Broker</label>
+                    <input id="mqtt_broker" value="${cfg.mqtt_broker || ''}">
+                </div>
+                <div class="form-group">
+                    <label>Port</label>
+                    <input id="mqtt_port" type="number" value="${cfg.mqtt_port || 1883}">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Device ID</label>
+                    <input id="device_id" value="${cfg.device_id || ''}" maxlength="10">
+                </div>
+                <div class="form-group">
+                    <label>MQTT Password</label>
+                    <input id="mqtt_pass" type="password" value="${cfg.mqtt_pass || ''}">
+                </div>
+            </div>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveNetwork()">💾 Lưu</button>
+        </div>
+    `;
+}
+
+function togglePass() {
+    const el = $('#wifi_pass');
+    el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+async function scanWifi() {
+    const btn = $('#btnScan');
+    const listDiv = $('#wifiList');
+    const inner = $('#wifiListInner');
+    
+    btn.disabled = true;
+    btn.textContent = '⏳ Scanning...';
+    listDiv.style.display = 'block';
+    inner.innerHTML = '<div style="padding:12px;text-align:center;color:#ccc">Đang quét mạng WiFi...</div>';
+
+    // Trigger scan and poll for results
+    await apiGet('/api/scan');
+    
+    let attempts = 0;
+    const poll = setInterval(async () => {
+        attempts++;
+        try {
+            const res = await apiGet('/api/scan');
+            if (res.status === 'done') {
+                clearInterval(poll);
+                btn.disabled = false;
+                btn.textContent = '📡 Scan';
+                
+                if (!res.networks || res.networks.length === 0) {
+                    inner.innerHTML = '<div style="padding:12px;text-align:center;color:#ccc">Không tìm thấy mạng WiFi</div>';
+                    return;
+                }
+
+                // Sort by signal strength
+                res.networks.sort((a, b) => b.rssi - a.rssi);
+                
+                // Remove duplicates (keep strongest)
+                const seen = new Set();
+                const unique = res.networks.filter(n => {
+                    if (n.ssid === '' || seen.has(n.ssid)) return false;
+                    seen.add(n.ssid);
+                    return true;
+                });
+
+                inner.innerHTML = unique.map(n => {
+                    const bars = n.rssi > -50 ? '▂▄▆█' : n.rssi > -65 ? '▂▄▆' : n.rssi > -75 ? '▂▄' : '▂';
+                    const lock = n.enc ? '🔒' : '';
+                    return `<div class="wifi-item" onclick="selectWifi('${n.ssid.replace(/'/g, "\\'")}')" 
+                        style="padding:10px 12px;cursor:pointer;border-bottom:1px solid #444;display:flex;justify-content:space-between;align-items:center;color:#fff"
+                        onmouseover="this.style.background='#3a3a6a'" onmouseout="this.style.background=''">
+                        <span>${lock} ${n.ssid}</span>
+                        <span style="color:#aaa;font-size:0.85em">${bars} ${n.rssi}dBm</span>
+                    </div>`;
+                }).join('');
+            }
+        } catch(e) {}
+        
+        if (attempts > 15) {
+            clearInterval(poll);
+            btn.disabled = false;
+            btn.textContent = '📡 Scan';
+            inner.innerHTML = '<div style="padding:12px;text-align:center;color:#f66">Scan timeout</div>';
+        }
+    }, 1500);
+}
+
+function selectWifi(ssid) {
+    $('#wifi_ssid').value = ssid;
+    $('#wifiList').style.display = 'none';
+    $('#wifi_pass').focus();
+}
+
+async function saveNetwork() {
+    const data = {
+        wifi_ssid: $('#wifi_ssid').value,
+        wifi_pass: $('#wifi_pass').value,
+        mqtt_broker: $('#mqtt_broker').value,
+        mqtt_port: parseInt($('#mqtt_port').value) || 1883,
+        device_id: $('#device_id').value,
+        mqtt_pass: $('#mqtt_pass').value
+    };
+    const res = await apiPost('/api/config/network', data);
+    if (res.ok) toast('Đã lưu cấu hình mạng');
+    else toast('Lỗi lưu config', 'error');
+}
+
+// ============================================================
+// Page: Analog config
+// ============================================================
+async function pageAnalog() {
+    const cfg = await apiGetConfig('/api/config/analog');
+    const channels = cfg.channels || {};
+
+    const names = ['A1','A2','A3','A4','A5','A6','A7','A8'];
+    const types = ['Điện áp','Điện áp','Điện áp','Điện áp','Dòng','Dòng','Dòng','Dòng'];
+
+    let rows = names.map((name, i) => {
+        const ch = channels[name] || {};
+        return `<tr>
+            <td><input type="checkbox" data-ch="${name}" class="ch-enable" ${ch.enabled ? 'checked' : ''}></td>
+            <td>${name} <small>(${types[i]})</small></td>
+            <td><select data-ch="${name}" class="ch-calc">
+                <option value="weight" ${ch.calc_mode==='weight'?'selected':''}>Weight</option>
+                <option value="interpolation_2point" ${ch.calc_mode==='interpolation_2point'?'selected':''}>Nội suy 2 điểm</option>
+            </select></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-weight" value="${ch.weight ?? ''}" style="width:80px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-x1" value="${ch.x1 ?? ''}" style="width:70px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-y1" value="${ch.y1 ?? ''}" style="width:70px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-x2" value="${ch.x2 ?? ''}" style="width:70px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-y2" value="${ch.y2 ?? ''}" style="width:70px"></td>
+        </tr>`;
+    }).join('');
+
+    content.innerHTML = `
+        <h2>📈 Cấu hình Analog</h2>
+        <div class="card">
+            <table>
+                <thead><tr>
+                    <th>Bật</th><th>Kênh</th><th>Calc mode</th><th>Weight</th>
+                    <th>X1</th><th>Y1</th><th>X2</th><th>Y2</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveAnalog()">💾 Lưu</button>
+        </div>
+    `;
+}
+
+async function saveAnalog() {
+    const channels = {};
+    ['A1','A2','A3','A4','A5','A6','A7','A8'].forEach(name => {
+        channels[name] = {
+            enabled: $(`.ch-enable[data-ch="${name}"]`).checked,
+            calc_mode: $(`.ch-calc[data-ch="${name}"]`).value,
+            weight: parseFloat($(`.ch-weight[data-ch="${name}"]`).value) || null,
+            x1: parseFloat($(`.ch-x1[data-ch="${name}"]`).value) || null,
+            y1: parseFloat($(`.ch-y1[data-ch="${name}"]`).value) || null,
+            x2: parseFloat($(`.ch-x2[data-ch="${name}"]`).value) || null,
+            y2: parseFloat($(`.ch-y2[data-ch="${name}"]`).value) || null,
+        };
+    });
+    const res = await apiPost('/api/config/analog', { channels });
+    if (res.ok) toast('Đã lưu cấu hình Analog');
+    else toast('Lỗi lưu', 'error');
+}
+
+// ============================================================
+// Page: Encoder config
+// ============================================================
+async function pageEncoder() {
+    const cfg = await apiGetConfig('/api/config/encoder');
+    const channels = cfg.channels || {};
+
+    let rows = ['E1','E2'].map(name => {
+        const ch = channels[name] || {};
+        return `<tr>
+            <td><input type="checkbox" data-ch="${name}" class="ch-enable" ${ch.enabled ? 'checked' : ''}></td>
+            <td>${name}</td>
+            <td><select data-ch="${name}" class="ch-calc">
+                <option value="weight" ${ch.calc_mode==='weight'?'selected':''}>Weight</option>
+                <option value="interpolation_2point" ${ch.calc_mode==='interpolation_2point'?'selected':''}>Nội suy 2 điểm</option>
+            </select></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-weight" value="${ch.weight ?? ''}" style="width:80px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-x1" value="${ch.x1 ?? ''}" style="width:70px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-y1" value="${ch.y1 ?? ''}" style="width:70px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-x2" value="${ch.x2 ?? ''}" style="width:70px"></td>
+            <td><input type="number" step="any" data-ch="${name}" class="ch-y2" value="${ch.y2 ?? ''}" style="width:70px"></td>
+        </tr>`;
+    }).join('');
+
+    content.innerHTML = `
+        <h2>🔄 Cấu hình Encoder</h2>
+        <div class="card">
+            <table>
+                <thead><tr><th>Bật</th><th>Kênh</th><th>Calc mode</th><th>Weight</th><th>X1</th><th>Y1</th><th>X2</th><th>Y2</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveEncoder()">💾 Lưu</button>
+        </div>
+    `;
+}
+
+async function saveEncoder() {
+    const channels = {};
+    ['E1','E2'].forEach(name => {
+        channels[name] = {
+            enabled: $(`.ch-enable[data-ch="${name}"]`).checked,
+            calc_mode: $(`.ch-calc[data-ch="${name}"]`).value,
+            weight: parseFloat($(`.ch-weight[data-ch="${name}"]`).value) || null,
+            x1: parseFloat($(`.ch-x1[data-ch="${name}"]`).value) || null,
+            y1: parseFloat($(`.ch-y1[data-ch="${name}"]`).value) || null,
+            x2: parseFloat($(`.ch-x2[data-ch="${name}"]`).value) || null,
+            y2: parseFloat($(`.ch-y2[data-ch="${name}"]`).value) || null,
+        };
+    });
+    const res = await apiPost('/api/config/encoder', { channels });
+    if (res.ok) toast('Đã lưu cấu hình Encoder');
+    else toast('Lỗi lưu', 'error');
+}
+
+// ============================================================
+// Page: DI (rain) config
+// ============================================================
+async function pageDi() {
+    const cfg = await apiGetConfig('/api/config/di');
+    const ch = (cfg.channels || {}).DI1 || {};
+
+    content.innerHTML = `
+        <h2>🌧 Cấu hình Cảm biến mưa (DI1)</h2>
+        <div class="card">
+            <div class="form-group">
+                <label><input type="checkbox" id="di_enabled" ${ch.enabled ? 'checked' : ''}> Kích hoạt DI1</label>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Calc mode</label>
+                    <select id="di_calc">
+                        <option value="weight" ${ch.calc_mode==='weight'?'selected':''}>Weight</option>
+                        <option value="interpolation_2point" ${ch.calc_mode==='interpolation_2point'?'selected':''}>Nội suy 2 điểm</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Weight (VD: 0.2 = mỗi xung 0.2mm)</label>
+                    <input id="di_weight" type="number" step="any" value="${ch.weight ?? ''}">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>X1</label><input id="di_x1" type="number" step="any" value="${ch.x1 ?? ''}"></div>
+                <div class="form-group"><label>Y1</label><input id="di_y1" type="number" step="any" value="${ch.y1 ?? ''}"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>X2</label><input id="di_x2" type="number" step="any" value="${ch.x2 ?? ''}"></div>
+                <div class="form-group"><label>Y2</label><input id="di_y2" type="number" step="any" value="${ch.y2 ?? ''}"></div>
+            </div>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveDi()">💾 Lưu</button>
+        </div>
+    `;
+}
+
+async function saveDi() {
+    const data = {
+        channels: {
+            DI1: {
+                enabled: $('#di_enabled').checked,
+                calc_mode: $('#di_calc').value,
+                weight: parseFloat($('#di_weight').value) || null,
+                x1: parseFloat($('#di_x1').value) || null,
+                y1: parseFloat($('#di_y1').value) || null,
+                x2: parseFloat($('#di_x2').value) || null,
+                y2: parseFloat($('#di_y2').value) || null,
+            }
+        }
+    };
+    const res = await apiPost('/api/config/di', data);
+    if (res.ok) toast('Đã lưu cấu hình DI');
+    else toast('Lỗi lưu', 'error');
+}
+
+// ============================================================
+// Page: RS485 config
+// ============================================================
+async function pageRs485() {
+    const cfg = await apiGetConfig('/api/config/rs485');
+
+    content.innerHTML = `
+        <h2>🔌 Cấu hình RS485 Modbus RTU</h2>
+        ${renderRs485Bus('rs485_1', 'Bus 1', cfg.rs485_1 || {})}
+        ${renderRs485Bus('rs485_2', 'Bus 2', cfg.rs485_2 || {})}
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveRs485()">💾 Lưu</button>
+        </div>
+    `;
+}
+
+function renderRs485Bus(busId, label, bus) {
+    const channels = bus.channels || [];
+    let rows = channels.map((ch, i) => renderRs485Row(busId, i, ch)).join('');
+
+    return `
+        <div class="card">
+            <h3>${label}</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Baud rate</label>
+                    <select id="${busId}_baud">
+                        ${[9600,19200,38400,115200].map(b => `<option value="${b}" ${bus.baud==b?'selected':''}>${b}</option>`).join('')}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Parity</label>
+                    <select id="${busId}_parity">
+                        <option value="none" ${bus.parity==='none'?'selected':''}>None</option>
+                        <option value="even" ${bus.parity==='even'?'selected':''}>Even</option>
+                        <option value="odd" ${bus.parity==='odd'?'selected':''}>Odd</option>
+                    </select>
+                </div>
+            </div>
+            <table id="${busId}_table">
+                <thead><tr>
+                    <th>Biến</th><th>Slave</th><th>Reg</th><th>FC</th><th>Type</th><th>Order</th>
+                    <th>Calc</th><th>Weight</th><th>X1</th><th>Y1</th><th>X2</th><th>Y2</th><th></th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+            <button class="btn btn-primary" style="margin-top:8px" onclick="addRs485Row('${busId}')">+ Thêm kênh</button>
+        </div>
+    `;
+}
+
+function renderRs485Row(busId, idx, ch) {
+    const vname = ch.name || ('V' + (idx + 1));
+    return `<tr>
+        <td><input type="text" class="rs-name" value="${vname}" style="width:45px" placeholder="V${idx+1}"></td>
+        <td><input type="number" class="rs-slave" value="${ch.slave_id ?? 1}" style="width:50px"></td>
+        <td><input type="number" class="rs-reg" value="${ch.register ?? 0}" style="width:60px"></td>
+        <td><select class="rs-fc"><option value="3" ${ch.fc==3?'selected':''}>03</option><option value="4" ${ch.fc==4?'selected':''}>04</option></select></td>
+        <td><select class="rs-dtype">${['INT16','UINT16','INT32','UINT32','FLOAT32'].map(t => `<option ${ch.data_type===t?'selected':''}>${t}</option>`).join('')}</select></td>
+        <td><select class="rs-order">${['BE','LE','MBE','MLE'].map(t => `<option ${ch.byte_order===t?'selected':''}>${t}</option>`).join('')}</select></td>
+        <td><select class="rs-calc"><option value="weight" ${ch.calc_mode==='weight'?'selected':''}>W</option><option value="interpolation_2point" ${ch.calc_mode==='interpolation_2point'?'selected':''}>2P</option></select></td>
+        <td><input type="number" step="any" class="rs-weight" value="${ch.weight ?? ''}" style="width:60px"></td>
+        <td><input type="number" step="any" class="rs-x1" value="${ch.x1 ?? ''}" style="width:55px"></td>
+        <td><input type="number" step="any" class="rs-y1" value="${ch.y1 ?? ''}" style="width:55px"></td>
+        <td><input type="number" step="any" class="rs-x2" value="${ch.x2 ?? ''}" style="width:55px"></td>
+        <td><input type="number" step="any" class="rs-y2" value="${ch.y2 ?? ''}" style="width:55px"></td>
+        <td><button class="btn btn-danger" onclick="this.closest('tr').remove()" style="padding:4px 8px">✕</button></td>
+    </tr>`;
+}
+
+function addRs485Row(busId) {
+    const tbody = $(`#${busId}_table tbody`);
+    const nextIdx = tbody.querySelectorAll('tr').length;
+    tbody.insertAdjacentHTML('beforeend', renderRs485Row(busId, nextIdx, {}));
+}
+
+function collectRs485Bus(busId) {
+    const rows = $$(`#${busId}_table tbody tr`);
+    const channels = [];
+    rows.forEach((tr, i) => {
+        channels.push({
+            name: tr.querySelector('.rs-name').value || ('V' + (i + 1)),
+            slave_id: parseInt(tr.querySelector('.rs-slave').value) || 1,
+            register: parseInt(tr.querySelector('.rs-reg').value) || 0,
+            fc: parseInt(tr.querySelector('.rs-fc').value),
+            data_type: tr.querySelector('.rs-dtype').value,
+            byte_order: tr.querySelector('.rs-order').value,
+            calc_mode: tr.querySelector('.rs-calc').value,
+            weight: parseFloat(tr.querySelector('.rs-weight').value) || null,
+            x1: parseFloat(tr.querySelector('.rs-x1').value) || null,
+            y1: parseFloat(tr.querySelector('.rs-y1').value) || null,
+            x2: parseFloat(tr.querySelector('.rs-x2').value) || null,
+            y2: parseFloat(tr.querySelector('.rs-y2').value) || null,
+        });
+    });
+    return {
+        baud: parseInt($(`#${busId}_baud`).value),
+        parity: $(`#${busId}_parity`).value,
+        channels
+    };
+}
+
+async function saveRs485() {
+    const data = {
+        rs485_1: collectRs485Bus('rs485_1'),
+        rs485_2: collectRs485Bus('rs485_2')
+    };
+    const res = await apiPost('/api/config/rs485', data);
+    if (res.ok) toast('Đã lưu cấu hình RS485');
+    else toast('Lỗi lưu', 'error');
+}
+
+// ============================================================
+// Page: TCP config
+// ============================================================
+async function pageTcp() {
+    const cfg = await apiGetConfig('/api/config/tcp');
+    const channels = cfg.channels || [];
+
+    let rows = channels.map((ch, i) => renderTcpRow(i, ch)).join('');
+
+    content.innerHTML = `
+        <h2>🖧 Cấu hình Modbus TCP</h2>
+        <div class="card">
+            <table id="tcp_table">
+                <thead><tr>
+                    <th>Biến</th><th>IP</th><th>Port</th><th>Slave</th><th>Reg</th><th>FC</th><th>Type</th><th>Order</th>
+                    <th>Calc</th><th>Weight</th><th>X1</th><th>Y1</th><th>X2</th><th>Y2</th><th></th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+            <button class="btn btn-primary" style="margin-top:8px" onclick="addTcpRow()">+ Thêm kênh</button>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveTcp()">💾 Lưu</button>
+        </div>
+    `;
+}
+
+function renderTcpRow(idx, ch) {
+    const vname = ch.name || ('V' + (idx + 1));
+    return `<tr>
+        <td><input type="text" class="tcp-name" value="${vname}" style="width:45px" placeholder="V${idx+1}"></td>
+        <td><input type="text" class="tcp-ip" value="${ch.ip || ''}" style="width:110px" placeholder="192.168.1.x"></td>
+        <td><input type="number" class="tcp-port" value="${ch.port || 502}" style="width:55px"></td>
+        <td><input type="number" class="tcp-slave" value="${ch.slave_id ?? 1}" style="width:45px"></td>
+        <td><input type="number" class="tcp-reg" value="${ch.register ?? 0}" style="width:55px"></td>
+        <td><select class="tcp-fc"><option value="3" ${ch.fc==3?'selected':''}>03</option><option value="4" ${ch.fc==4?'selected':''}>04</option></select></td>
+        <td><select class="tcp-dtype">${['INT16','UINT16','INT32','UINT32','FLOAT32'].map(t => `<option ${ch.data_type===t?'selected':''}>${t}</option>`).join('')}</select></td>
+        <td><select class="tcp-order">${['BE','LE','MBE','MLE'].map(t => `<option ${ch.byte_order===t?'selected':''}>${t}</option>`).join('')}</select></td>
+        <td><select class="tcp-calc"><option value="weight" ${ch.calc_mode==='weight'?'selected':''}>W</option><option value="interpolation_2point" ${ch.calc_mode==='interpolation_2point'?'selected':''}>2P</option></select></td>
+        <td><input type="number" step="any" class="tcp-weight" value="${ch.weight ?? ''}" style="width:55px"></td>
+        <td><input type="number" step="any" class="tcp-x1" value="${ch.x1 ?? ''}" style="width:50px"></td>
+        <td><input type="number" step="any" class="tcp-y1" value="${ch.y1 ?? ''}" style="width:50px"></td>
+        <td><input type="number" step="any" class="tcp-x2" value="${ch.x2 ?? ''}" style="width:50px"></td>
+        <td><input type="number" step="any" class="tcp-y2" value="${ch.y2 ?? ''}" style="width:50px"></td>
+        <td><button class="btn btn-danger" onclick="this.closest('tr').remove()" style="padding:4px 8px">✕</button></td>
+    </tr>`;
+}
+
+function addTcpRow() {
+    const tbody = $('#tcp_table tbody');
+    const nextIdx = tbody.querySelectorAll('tr').length;
+    tbody.insertAdjacentHTML('beforeend', renderTcpRow(nextIdx, {}));
+}
+
+async function saveTcp() {
+    const rows = $$('#tcp_table tbody tr');
+    const channels = [];
+    rows.forEach((tr, i) => {
+        channels.push({
+            name: tr.querySelector('.tcp-name').value || ('V' + (i + 1)),
+            ip: tr.querySelector('.tcp-ip').value,
+            port: parseInt(tr.querySelector('.tcp-port').value) || 502,
+            slave_id: parseInt(tr.querySelector('.tcp-slave').value) || 1,
+            register: parseInt(tr.querySelector('.tcp-reg').value) || 0,
+            fc: parseInt(tr.querySelector('.tcp-fc').value),
+            data_type: tr.querySelector('.tcp-dtype').value,
+            byte_order: tr.querySelector('.tcp-order').value,
+            calc_mode: tr.querySelector('.tcp-calc').value,
+            weight: parseFloat(tr.querySelector('.tcp-weight').value) || null,
+            x1: parseFloat(tr.querySelector('.tcp-x1').value) || null,
+            y1: parseFloat(tr.querySelector('.tcp-y1').value) || null,
+            x2: parseFloat(tr.querySelector('.tcp-x2').value) || null,
+            y2: parseFloat(tr.querySelector('.tcp-y2').value) || null,
+        });
+    });
+    const res = await apiPost('/api/config/tcp', { channels });
+    if (res.ok) toast('Đã lưu cấu hình TCP');
+    else toast('Lỗi lưu', 'error');
+}
+
+// ============================================================
+// Page: Monitor
+// ============================================================
+async function pageMonitor() {
+    content.innerHTML = `
+        <h2>📡 Giám sát Realtime</h2>
+        <div class="card">
+            <table id="monitor_table">
+                <thead><tr><th>Group</th><th>Channel</th><th>Raw</th><th>Real</th><th>Trạng thái</th></tr></thead>
+                <tbody><tr><td colspan="5">Chưa có dữ liệu (chờ sensor module)</td></tr></tbody>
+            </table>
+        </div>
+    `;
+}
+
+// ============================================================
+// Page: System
+// ============================================================
+async function pageSystem() {
+    const cfg = await apiGetConfig('/api/config/system');
+    content.innerHTML = `
+        <h2>⚙ Hệ thống</h2>
+        <div class="card">
+            <h3>Thiết bị</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Tên thiết bị (hostname)</label>
+                    <input id="sys_hostname" value="${cfg.hostname || 'THUYDIEN'}" placeholder="THUYDIEN">
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <h3>WiFi AP (chế độ cấu hình)</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>AP SSID</label>
+                    <input id="sys_ap_ssid" value="${cfg.ap_ssid || 'THUYDIEN_CFG'}" placeholder="THUYDIEN_CFG">
+                </div>
+                <div class="form-group">
+                    <label>AP Password (≥8 ký tự)</label>
+                    <input id="sys_ap_pass" value="${cfg.ap_pass || '12345678'}" placeholder="12345678">
+                </div>
+            </div>
+        </div>
+        <div class="btn-group">
+            <button class="btn btn-primary" onclick="saveSystem()">💾 Lưu</button>
+        </div>
+        <div class="card" style="margin-top:16px">
+            <h3>Khởi động lại</h3>
+            <p>ESP32 sẽ restart và áp dụng config mới.</p>
+            <div class="btn-group">
+                <button class="btn btn-danger" onclick="doRestart()">🔄 Restart</button>
+            </div>
+        </div>
+        <div class="card" style="margin-top:16px">
+            <h3>⚠ Xóa toàn bộ cấu hình</h3>
+            <p>Xóa hết file config trên SD card (WiFi, MQTT, Analog, RS485, TCP...). Thiết bị sẽ trở về mặc định.</p>
+            <div class="btn-group">
+                <button class="btn btn-danger" onclick="doClearConfig()">🗑 Clear Config</button>
+            </div>
+        </div>
+    `;
+}
+
+async function saveSystem() {
+    const data = {
+        hostname: $('#sys_hostname').value,
+        ap_ssid: $('#sys_ap_ssid').value,
+        ap_pass: $('#sys_ap_pass').value
+    };
+    if (data.ap_pass.length > 0 && data.ap_pass.length < 8) {
+        toast('AP Password phải ≥ 8 ký tự', 'error');
+        return;
+    }
+    const res = await apiPost('/api/config/system', data);
+    if (res.ok) toast('Đã lưu cấu hình hệ thống');
+    else toast('Lỗi lưu', 'error');
+}
+
+async function doRestart() {
+    if (confirm('Xác nhận khởi động lại?')) {
+        await apiPost('/api/restart', {});
+        toast('Đang khởi động lại...');
+    }
+}
+
+async function doClearConfig() {
+    if (confirm('XÓA TOÀN BỘ cấu hình? Thiết bị sẽ trở về mặc định!')) {
+        const res = await apiPost('/api/clear-config', {});
+        if (res.ok) {
+            // Xóa cache JS
+            Object.keys(configCache).forEach(k => delete configCache[k]);
+            toast(`Đã xóa ${res.cleared} file config`);
+        } else {
+            toast('Lỗi xóa config', 'error');
+        }
+    }
+}
+
+// ============================================================
+// Router
+// ============================================================
+const pages = {
+    home: pageHome,
+    network: pageNetwork,
+    analog: pageAnalog,
+    encoder: pageEncoder,
+    di: pageDi,
+    rs485: pageRs485,
+    tcp: pageTcp,
+    monitor: pageMonitor,
+    system: pageSystem,
+};
+
+function navigate(page) {
+    // Update active sidebar
+    $$('.sidebar a').forEach(a => a.classList.remove('active'));
+    const link = $(`.sidebar a[data-page="${page}"]`);
+    if (link) link.classList.add('active');
+
+    // Load page
+    const fn = pages[page];
+    if (fn) fn();
+    else content.innerHTML = '<h2>404</h2><p>Trang không tồn tại</p>';
+}
+
+// Sidebar click handler
+$$('.sidebar a[data-page]').forEach(a => {
+    a.addEventListener('click', (e) => {
+        e.preventDefault();
+        navigate(a.dataset.page);
+    });
+});
+
+// Init
+navigate('home');

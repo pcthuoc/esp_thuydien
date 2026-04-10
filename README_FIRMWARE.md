@@ -433,3 +433,163 @@ Firmware có thể khai báo kiểu dữ liệu ở **root level** của payload
 |---------|---------|-------------|
 | `"realtime"` | Thời gian thực | Mặc định, **không cần gửi** |
 | `"backfill"` | Bù dữ liệu | Firmware mất mạng, lưu local, gửi lại sau |
+
+
+
+
+
+
+---
+
+### [2026-04-08] Thêm OTA (Over-The-Air) firmware update
+
+#### Nhận lệnh OTA qua `station/{device_id}/cmd`
+
+Server gửi lệnh OTA khi admin bấm nút cập nhật firmware trên trang Workbench:
+
+```json
+{
+  "cmd": "ota_update",
+  "url": "http://server-domain/media/firmware/O1SGXJNPFJ.bin",
+  "checksum": "a1b2c3d4e5f6...sha256_hex_64_ký_tự..."
+}
+```
+
+| Field | Kiểu | Mô tả |
+|-------|------|-------|
+| `cmd` | string | Luôn là `"ota_update"` |
+| `url` | string | URL tải file firmware `.bin` (HTTP GET) |
+| `checksum` | string | SHA256 hex của file firmware — dùng để verify sau khi tải |
+
+#### Firmware cần làm khi nhận `ota_update`
+
+1. **Tải file** từ `url` (HTTP GET)
+2. **Verify checksum**: tính SHA256 của file vừa tải, so với `checksum` — nếu sai → báo `failed`
+3. **Flash firmware** vào partition OTA
+4. **Restart** thiết bị
+5. **Sau khi boot lại** — gửi status online với `fw_version` mới
+
+#### Báo tiến trình OTA qua `station/{device_id}/status`
+
+Trong suốt quá trình OTA, firmware **phải gửi cập nhật tiến trình** lên topic status để server theo dõi realtime:
+
+```json
+{
+  "ota_status": "downloading",
+  "ota_progress": 45,
+  "ts": "2026-04-08T10:00:05+07:00"
+}
+```
+
+**Bảng `ota_status`:**
+
+| `ota_status` | Khi nào gửi | `ota_progress` | Fields thêm |
+|-------------|-------------|:--------------:|-------------|
+| `downloading` | Đang tải file firmware | 0 → 99 (theo % đã tải) | |
+| `flashing` | Đang ghi firmware vào flash | 100 | |
+| `rebooting` | Sắp restart | 100 | |
+| `done` | Boot lại thành công, firmware mới hoạt động | 100 | `fw_version` |
+| `failed` | Bất kỳ bước nào lỗi | giữ nguyên giá trị cuối | `ota_error` |
+
+**Payload mẫu cho từng trạng thái:**
+
+Đang tải (cập nhật nhiều lần theo %):
+```json
+{
+  "ota_status": "downloading",
+  "ota_progress": 30,
+  "ts": "2026-04-08T10:00:03+07:00"
+}
+```
+
+Đang flash:
+```json
+{
+  "ota_status": "flashing",
+  "ota_progress": 100,
+  "ts": "2026-04-08T10:00:10+07:00"
+}
+```
+
+Sắp restart:
+```json
+{
+  "ota_status": "rebooting",
+  "ota_progress": 100,
+  "ts": "2026-04-08T10:00:12+07:00"
+}
+```
+
+Thành công (sau khi boot lại):
+```json
+{
+  "ota_status": "done",
+  "ota_progress": 100,
+  "fw_version": "1.0.3",
+  "ts": "2026-04-08T10:00:20+07:00"
+}
+```
+
+Thất bại (bất kỳ lúc nào):
+```json
+{
+  "ota_status": "failed",
+  "ota_progress": 45,
+  "ota_error": "Checksum mismatch",
+  "ts": "2026-04-08T10:00:08+07:00"
+}
+```
+
+**Bảng fields:**
+
+| Field | Kiểu | Bắt buộc | Giới hạn | Mô tả |
+|-------|------|:--------:|----------|-------|
+| `ota_status` | string | ✅ | max 20 ký tự | Trạng thái hiện tại |
+| `ota_progress` | int | ✅ | 0–100 | Phần trăm tiến trình |
+| `ota_error` | string | ❌ | max 255 ký tự | Mô tả lỗi (chỉ khi `failed`) |
+| `fw_version` | string | ❌ | max 32 ký tự | Phiên bản mới (chỉ khi `done`) |
+| `ts` | string | ✅ | ISO 8601 + timezone | Thời điểm gửi |
+
+#### Flow OTA đầy đủ
+
+```
+[Server gửi cmd]
+  │  station/{device_id}/cmd
+  │  {"cmd":"ota_update","url":"...","checksum":"..."}
+  │
+  ▼
+[Firmware nhận lệnh]
+  │
+  ├─ Bắt đầu tải → publish status:
+  │    {"ota_status":"downloading","ota_progress":0,"ts":"..."}
+  │
+  ├─ Tải được 30% → publish:
+  │    {"ota_status":"downloading","ota_progress":30,"ts":"..."}
+  │
+  ├─ Tải xong 100% → verify checksum
+  │    ├─ Sai → {"ota_status":"failed","ota_error":"Checksum mismatch","ts":"..."}
+  │    └─ Đúng → tiếp tục
+  │
+  ├─ Flash firmware → publish:
+  │    {"ota_status":"flashing","ota_progress":100,"ts":"..."}
+  │
+  ├─ Restart → publish:
+  │    {"ota_status":"rebooting","ota_progress":100,"ts":"..."}
+  │
+  └─ [REBOOT]
+       │
+       ├─ Publish status online (như mục 3.2)
+       └─ Publish OTA done:
+            {"ota_status":"done","ota_progress":100,"fw_version":"1.0.3","ts":"..."}
+```
+
+#### Lưu ý OTA
+
+| # | Vấn đề | Quy tắc |
+|---|--------|---------|
+| 1 | Checksum **bắt buộc verify** | Không flash nếu SHA256 không khớp |
+| 2 | Gửi progress thường xuyên | Tối thiểu mỗi 10% hoặc mỗi 5 giây |
+| 3 | Timeout tải file | Nên timeout sau 60–120 giây, báo `failed` |
+| 4 | Rollback | Nếu firmware mới boot lỗi → rollback về partition cũ, báo `failed` |
+| 5 | OTA status gửi trên topic **status** | Cùng topic `station/{device_id}/status`, **không phải** topic cmd |
+| 6 | Kết hợp với status online | Sau reboot, 1 message có cả `"status":"online"` và `"ota_status":"done"` là hợp lệ |

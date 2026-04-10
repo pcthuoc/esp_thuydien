@@ -1,5 +1,6 @@
 #include "modbus_rtu.h"
 #include "sd_card.h"
+#include "debug_config.h"
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
 
@@ -33,10 +34,10 @@ static ModbusMaster node1;
 
 static MbDataType parseDataType(const char* s) {
     if (!s) return MB_UINT16;
-    if (strcmp(s, "INT16") == 0)   return MB_INT16;
-    if (strcmp(s, "INT32") == 0)   return MB_INT32;
-    if (strcmp(s, "UINT32") == 0)  return MB_UINT32;
-    if (strcmp(s, "FLOAT32") == 0) return MB_FLOAT32;
+    if (strcasecmp(s, "INT16") == 0)   return MB_INT16;
+    if (strcasecmp(s, "INT32") == 0)   return MB_INT32;
+    if (strcasecmp(s, "UINT32") == 0)  return MB_UINT32;
+    if (strcasecmp(s, "FLOAT32") == 0) return MB_FLOAT32;
     return MB_UINT16;
 }
 
@@ -135,15 +136,25 @@ static void loadBusConfig(MbBus& bus, JsonObject busObj) {
         c.name[sizeof(c.name) - 1] = '\0';
 
         c.slave_id  = ch["slave_id"] | 1;
-        c.reg_addr  = ch["register"] | 0;
-        c.fc        = ch["fc"] | 3;
-        c.data_type = parseDataType(ch["data_type"]);
-        c.byte_order = parseByteOrder(ch["byte_order"]);
+        c.reg_addr = (uint16_t)(ch["register"] | 0);
+        // function_code: support string "03"/"04" (server format) or numeric fc (legacy)
+        const char* fcStr = ch["function_code"] | (const char*)nullptr;
+        if (fcStr) {
+            int n = atoi(fcStr);
+            c.fc = (n == 4) ? 4 : 3;
+        } else {
+            c.fc = ch["fc"] | 3;
+        }
+        c.data_type  = parseDataType(ch["data_type"]);
+        // register_order (server format) or byte_order (legacy)
+        const char* regOrder = ch["register_order"] | (const char*)nullptr;
+        if (!regOrder) regOrder = ch["byte_order"] | "BE";
+        c.byte_order = parseByteOrder(regOrder);
         c.value = 0;
         c.valid = false;
 
         bus.count++;
-        Serial.printf("[MODBUS] Bus channel: %s slave=%d reg=%d fc=%d\n",
+        LOG_IF(LOG_MODBUS, "[MODBUS] Bus channel: %s slave=%d reg=%d fc=%d\n",
                       c.name, c.slave_id, c.reg_addr, c.fc);
     }
 }
@@ -168,6 +179,8 @@ static bool readChannel(ModbusMaster& node, HardwareSerial& serial,
 
     if (result != node.ku8MBSuccess) {
         ch.valid = false;
+        LOG_IF(LOG_MODBUS, "[MODBUS] %s err=0x%02X (slave=%d reg=%d fc=%d)\n",
+               ch.name, result, ch.slave_id, ch.reg_addr, ch.fc);
         return false;
     }
 
@@ -191,13 +204,13 @@ bool modbus_rtu_init() {
     // Đọc config từ SD
     String json = sd_read_file("/config/rs485.json");
     if (json.length() == 0) {
-        Serial.println("[MODBUS] Không tìm thấy /config/rs485.json");
+        LOGLN_IF(LOG_MODBUS, "[MODBUS] Không tìm thấy /config/rs485.json");
         return false;
     }
 
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
-        Serial.println("[MODBUS] JSON parse lỗi");
+        LOGLN_IF(LOG_MODBUS, "[MODBUS] JSON parse lỗi");
         return false;
     }
 
@@ -207,14 +220,14 @@ bool modbus_rtu_init() {
     }
 
     if (bus1.count == 0) {
-        Serial.println("[MODBUS] Bus1 không có channel");
+        LOGLN_IF(LOG_MODBUS, "[MODBUS] Bus1 không có channel");
         return false;
     }
 
     // Init UART Bus 1
     BUS1_SERIAL.begin(bus1.baud, serialConfig(bus1.parity), BUS1_RX, BUS1_TX);
     node1.begin(1, BUS1_SERIAL);
-    Serial.printf("[MODBUS] Bus1 init: %lu 8%c1, %d channels\n",
+    LOG_IF(LOG_MODBUS, "[MODBUS] Bus1 init: %lu 8%c1, %d channels\n",
                   bus1.baud,
                   bus1.parity == 1 ? 'E' : (bus1.parity == 2 ? 'O' : 'N'),
                   bus1.count);
@@ -225,9 +238,8 @@ void modbus_rtu_poll() {
     for (uint8_t i = 0; i < bus1.count; i++) {
         MbChannel& ch = bus1.channels[i];
         bool ok = readChannel(node1, BUS1_SERIAL, ch);
-        if (!ok) {
-            Serial.printf("[MODBUS] %s FAIL (slave=%d reg=%d)\n",
-                          ch.name, ch.slave_id, ch.reg_addr);
+        if (ok) {
+            LOG_IF(LOG_MODBUS, "[MODBUS] %s = %.4f\n", ch.name, ch.value);
         }
         delay(MODBUS_REQUEST_DELAY);
     }

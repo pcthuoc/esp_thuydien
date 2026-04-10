@@ -1,4 +1,5 @@
 #include "counter.h"
+#include "debug_config.h"
 #include "driver/pcnt.h"
 
 // ============================================================
@@ -35,7 +36,7 @@ void counter_init() {
         pcnt_counter_clear(units[i]);
         pcnt_counter_resume(units[i]);
 
-        Serial.printf("[COUNTER] CH%d init OK (GPIO%d)\n", i + 1, pins[i]);
+        LOG_IF(LOG_COUNTER, "[COUNTER] CH%d init OK (GPIO%d)\n", i + 1, pins[i]);
     }
 }
 
@@ -51,5 +52,5 @@ void counter_reset(uint8_t ch) {
     pcnt_counter_pause(units[ch]);
     pcnt_counter_clear(units[ch]);
     pcnt_counter_resume(units[ch]);
-    Serial.printf("[COUNTER] CH%d reset\n", ch + 1);
+    LOG_IF(LOG_COUNTER, "[COUNTER] CH%d reset\n", ch + 1);
 }

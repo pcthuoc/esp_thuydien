@@ -1,28 +1,30 @@
 #include "analog_reader.h"
+#include "debug_config.h"
 #include <Adafruit_ADS1X15.h>
+#include <Wire.h>
 
 // ============================================================
 // Hardware config (từ schematic)
 // ============================================================
 
-// ADS1115 #1 — Voltage (ADDR = GND → 0x48)
-// Input: 0-10V
-// Divider: 100kΩ series + 22kΩ shunt
-// V_ain = V_in × 22k/(100k+22k) → max 10V = 1.803V (trong range GAIN_ONE ±4.096V)
-// V_in = V_ain × (100k + 22k) / 22k = V_ain × 5.5455
-#define ADS1_ADDR           0x48
-#define VOLTAGE_DIVIDER     5.5455f   // (100k + 22k) / 22k
-
-// ADS1115 #2 — Current (ADDR = VDD → 0x49)
+// ADS1115 #1 — Current (ADDR = GND → 0x48)
 // Input: 0-20mA (24VDC loop) hoặc 4-20mA
 // Shunt: 100Ω (1kΩ series protection, negligible với ADS input impedance)
 // V_ain = I × 100Ω → max 20mA = 2.0V (trong range GAIN_ONE ±4.096V)
 // I(mA) = V_ain(V) / R_shunt × 1000 = V_ain(V) × 10
-#define ADS2_ADDR           0x49
+#define ADS1_ADDR           0x48
 #define SHUNT_RESISTANCE    100.0f    // 100Ω
 
-static Adafruit_ADS1115 ads1;  // Voltage (0x48)
-static Adafruit_ADS1115 ads2;  // Current (0x49)
+// ADS1115 #2 — Voltage (ADDR = VDD → 0x49)
+// Input: 0-10V
+// Divider: 100kΩ series + 22kΩ shunt
+// V_ain = V_in × 22k/(100k+22k) → max 10V = 1.803V (trong range GAIN_ONE ±4.096V)
+// V_in = V_ain × (100k + 22k) / 22k = V_ain × 5.5455
+#define ADS2_ADDR           0x49
+#define VOLTAGE_DIVIDER     5.5455f   // (100k + 22k) / 22k
+
+static Adafruit_ADS1115 ads1;  // Current (0x48)
+static Adafruit_ADS1115 ads2;  // Voltage (0x49)
 static bool ads1Found = false;
 static bool ads2Found = false;
 
@@ -40,18 +42,18 @@ bool analog_init() {
     ads1.setGain(GAIN_ONE);  // ±4.096V (LSB = 0.125mV)
     if (ads1.begin(ADS1_ADDR)) {
         ads1Found = true;
-        Serial.println("[ADS] #1 (0x48) Voltage OK");
+        LOGLN_IF(LOG_ADS, "[ADS] #1 (0x48) Voltage OK");
     } else {
-        Serial.println("[ADS] #1 (0x48) Voltage NOT found");
+        LOGLN_IF(LOG_ADS, "[ADS] #1 (0x48) Voltage NOT found");
     }
 
     // ADS1115 #2 — Current
     ads2.setGain(GAIN_ONE);  // ±4.096V
     if (ads2.begin(ADS2_ADDR)) {
         ads2Found = true;
-        Serial.println("[ADS] #2 (0x49) Current OK");
+        LOGLN_IF(LOG_ADS, "[ADS] #2 (0x49) Current OK");
     } else {
-        Serial.println("[ADS] #2 (0x49) Current NOT found");
+        LOGLN_IF(LOG_ADS, "[ADS] #2 (0x49) Current NOT found");
     }
 
     return ads1Found || ads2Found;
@@ -62,24 +64,23 @@ bool analog_init() {
 // ============================================================
 
 void analog_poll() {
-    // A1-A4: ADS1115 #1 (Voltage, 0x48)
+    // A1-A4: ADS1115 #1 (Current, 0x48) — shunt 100Ω
     if (ads1Found) {
         for (uint8_t i = 0; i < 4; i++) {
             int16_t raw = ads1.readADC_SingleEnded(i);
             if (raw < 0) {
                 channels[i].valid = false;
-                Serial.printf("[ADS] A%d: READ ERROR (raw=%d)\n", i + 1, raw);
+                LOG_IF(LOG_ADS, "[ADS] A%d: READ ERROR (raw=%d)\n", i + 1, raw);
                 continue;
             }
 
-            // Voltage tại chân ADS (mV)
             float v_ain = ads1.computeVolts(raw);
 
             channels[i].raw_count = raw;
             channels[i].raw_adc = v_ain * 1000.0f;  // mV
-            channels[i].value = v_ain * VOLTAGE_DIVIDER;  // Voltage thực (V)
+            channels[i].value = (v_ain / SHUNT_RESISTANCE) * 1000.0f;  // mA
             channels[i].valid = true;
-            Serial.printf("[ADS] A%d: raw=%d  adc=%.1fmV  volt=%.3fV\n",
+            LOG_IF(LOG_ADS, "[ADS] A%d: raw=%d  adc=%.1fmV  curr=%.3fmA\n",
                           i + 1, raw, v_ain * 1000.0f, channels[i].value);
         }
     } else {
@@ -88,13 +89,13 @@ void analog_poll() {
         }
     }
 
-    // A5-A8: ADS1115 #2 (Current, 0x49)
+    // A5-A8: ADS1115 #2 (Voltage, 0x49) — divider 100k/22k
     if (ads2Found) {
         for (uint8_t i = 0; i < 4; i++) {
             int16_t raw = ads2.readADC_SingleEnded(i);
             if (raw < 0) {
                 channels[4 + i].valid = false;
-                Serial.printf("[ADS] A%d: READ ERROR (raw=%d)\n", i + 5, raw);
+                LOG_IF(LOG_ADS, "[ADS] A%d: READ ERROR (raw=%d)\n", i + 5, raw);
                 continue;
             }
 
@@ -102,9 +103,9 @@ void analog_poll() {
 
             channels[4 + i].raw_count = raw;
             channels[4 + i].raw_adc = v_ain * 1000.0f;  // mV
-            channels[4 + i].value = (v_ain / SHUNT_RESISTANCE) * 1000.0f;  // mA
+            channels[4 + i].value = v_ain * VOLTAGE_DIVIDER;  // Voltage thực (V)
             channels[4 + i].valid = true;
-            Serial.printf("[ADS] A%d: raw=%d  adc=%.1fmV  curr=%.3fmA\n",
+            LOG_IF(LOG_ADS, "[ADS] A%d: raw=%d  adc=%.1fmV  volt=%.3fV\n",
                           i + 5, raw, v_ain * 1000.0f, channels[4 + i].value);
         }
     } else {

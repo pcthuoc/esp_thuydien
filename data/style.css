@@ -171,6 +171,17 @@ body {
     background: #dc2626;
 }
 
+.btn-expand {
+    background: #334155;
+    color: #e2e8f0;
+    border: 1px solid #475569;
+}
+
+.btn-expand:hover {
+    background: #475569;
+    color: #fff;
+}
+
 .btn-group {
     display: flex;
     gap: 8px;
@@ -200,6 +211,18 @@ th {
 
 tr:hover {
     background: #f8fafc;
+}
+
+tr.detail-row td {
+    background: #f1f5f9;
+    border-bottom: 2px solid #cbd5e1;
+    color: #1e293b;
+}
+
+tr.detail-row td label,
+tr.detail-row td select,
+tr.detail-row td input {
+    color: #1e293b;
 }
 
 /* Toast notification */

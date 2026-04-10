@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include "modbus_rtu.h"  // Dùng chung MbDataType, MbByteOrder
 
-#define TCP_MAX_CHANNELS  10
+#define TCP_MAX_CHANNELS  20  // Tối đa 20 kênh TCP (5 slave × 4 biến)
 
 struct TcpChannel {
     char name[8];       // "V1", "V2"...
@@ -17,7 +17,10 @@ struct TcpChannel {
     bool valid;
 };
 
-// Init W5500 Ethernet (SPI) + đọc config từ SD
+// Init W5500 hardware (SPI, DHCP) — gọi độc lập, không cần config
+bool w5500_init();
+
+// Load channel config từ SD + kích hoạt poll
 bool modbus_tcp_init();
 
 // Poll tất cả channels

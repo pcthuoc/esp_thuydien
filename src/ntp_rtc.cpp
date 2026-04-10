@@ -114,13 +114,25 @@ bool ntp_rtc_init() {
     // Đọc RTC → set system clock tạm (sẽ bị NTP ghi đè khi có mạng)
     struct tm rtcTime;
     if (ds3231_read(&rtcTime)) {
-        time_t epoch = mktime(&rtcTime);
+        // RTC lưu giờ UTC → mktime phải chạy trong context UTC
+        // (trước khi configTime được gọi, TZ có thể chưa set đúng)
+        setenv("TZ", "UTC0", 1);
+        tzset();
+        time_t epoch = mktime(&rtcTime);  // UTC struct tm → UTC epoch
+
+        // Đặt timezone Việt Nam UTC+7 (POSIX: UTC-7 = UTC+7)
+        setenv("TZ", "UTC-7", 1);
+        tzset();
+
         struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
         settimeofday(&tv, NULL);
 
+        // Log giờ local (UTC+7) để kiểm tra
+        struct tm localTm;
+        getLocalTime(&localTm);
         char buf[32];
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &rtcTime);
-        Serial.printf("[RTC] Clock tạm từ RTC: %s%s\n", buf,
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &localTm);
+        Serial.printf("[RTC] Clock tạm từ RTC: %s (UTC+7)%s\n", buf,
             osfOk ? "" : " (OSF — có thể sai)");
     } else {
         Serial.println("[RTC] Failed to read DS3231");
@@ -158,10 +170,16 @@ bool ntp_rtc_sync_ntp() {
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
     Serial.printf("[NTP] Synced: %s (UTC+7)\n", buf);
 
-    // Ghi vào RTC
+    // Ghi UTC vào RTC (không phải local time)
     if (rtcFound) {
-        if (ds3231_write(&timeinfo)) {
-            Serial.println("[NTP] -> RTC updated");
+        time_t now;
+        time(&now);
+        struct tm utcTime;
+        gmtime_r(&now, &utcTime);
+        if (ds3231_write(&utcTime)) {
+            char ubuf[32];
+            strftime(ubuf, sizeof(ubuf), "%Y-%m-%d %H:%M:%S", &utcTime);
+            Serial.printf("[NTP] -> RTC updated (UTC): %s\n", ubuf);
         } else {
             Serial.println("[NTP] -> RTC write FAILED");
         }

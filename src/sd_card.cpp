@@ -1,6 +1,7 @@
 #include "sd_card.h"
 #include <SD_MMC.h>
 #include <FS.h>
+#include <algorithm>
 
 bool sd_init() {
     pinMode(SD_DET_PIN, INPUT_PULLUP);
@@ -36,6 +37,11 @@ bool sd_is_inserted() {
 }
 
 bool sd_write_file(const char* path, const char* content) {
+    // Đảm bảo thư mục cha tồn tại trước khi mở
+    String p(path);
+    int slash = p.lastIndexOf('/');
+    if (slash > 0) sd_mkdir(p.substring(0, slash).c_str());
+
     File file = SD_MMC.open(path, FILE_WRITE);
     if (!file) {
         Serial.printf("[SD] Failed to open %s for writing\n", path);
@@ -47,6 +53,11 @@ bool sd_write_file(const char* path, const char* content) {
 }
 
 bool sd_append_file(const char* path, const char* content) {
+    // Đảm bảo thư mục cha tồn tại trước khi mở
+    String p(path);
+    int slash = p.lastIndexOf('/');
+    if (slash > 0) sd_mkdir(p.substring(0, slash).c_str());
+
     File file = SD_MMC.open(path, FILE_APPEND);
     if (!file) {
         Serial.printf("[SD] Failed to open %s for append\n", path);
@@ -76,8 +87,25 @@ bool sd_remove(const char* path) {
     return SD_MMC.remove(path);
 }
 
+// Tạo thư mục kể cả các cấp cha chưa tồn tại (giống mkdir -p)
 bool sd_mkdir(const char* path) {
-    return SD_MMC.mkdir(path);
+    if (SD_MMC.exists(path)) return true;
+
+    // Đi từ gốc, tạo từng cấp một
+    String p(path);
+    // Bỏ slash đầu
+    int start = (p.startsWith("/")) ? 1 : 0;
+    int pos = start;
+    while (pos <= (int)p.length()) {
+        int slash = p.indexOf('/', pos);
+        if (slash == -1) slash = p.length();
+        String sub = p.substring(0, slash);
+        if (sub.length() > 0 && !SD_MMC.exists(sub.c_str())) {
+            SD_MMC.mkdir(sub.c_str());
+        }
+        pos = slash + 1;
+    }
+    return SD_MMC.exists(path);
 }
 
 uint64_t sd_total_bytes() {
@@ -86,4 +114,33 @@ uint64_t sd_total_bytes() {
 
 uint64_t sd_used_bytes() {
     return SD_MMC.usedBytes();
+}
+
+// ============================================================
+// Liệt kê tên entry trong thư mục (không đệ quy, đã sắp xếp)
+// ============================================================
+std::vector<String> sd_list_dir(const char* path) {
+    std::vector<String> result;
+    if (!SD_MMC.exists(path)) return result;  // không tồn tại → trả về rỗng, không log lỗi
+    File dir = SD_MMC.open(path);
+    if (!dir || !dir.isDirectory()) return result;
+
+    File entry = dir.openNextFile();
+    while (entry) {
+        String fullName = entry.name();
+        // entry.name() trả full path từ root SD, lấy phần cuối
+        int lastSlash = fullName.lastIndexOf('/');
+        String name = (lastSlash >= 0) ? fullName.substring(lastSlash + 1) : fullName;
+        if (name.length() > 0) result.push_back(name);
+        entry.close();
+        entry = dir.openNextFile();
+    }
+    dir.close();
+
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+bool sd_rmdir(const char* path) {
+    return SD_MMC.rmdir(path);
 }

@@ -1,8 +1,11 @@
 #include "mqtt_client.h"
 #include "sd_card.h"
+#include "debug_config.h"
 #include "led_status.h"
 #include "ntp_rtc.h"
 #include "data_collector.h"
+#include "ota_update.h"
+#include "error_log.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -17,7 +20,7 @@ static String cfg_device_id;
 static String cfg_mqtt_pass;
 
 // Firmware version
-#define FW_VERSION "1.0.0"
+#include "version.h"
 
 // Topics
 static String topic_data;
@@ -46,7 +49,7 @@ static void applyServerGroup(JsonDocument& serverDoc, const char* group, const c
     if (!serverDoc[group].is<JsonObject>()) return;
     JsonObject serverGroup = serverDoc[group];
 
-    Serial.printf("[MQTT] Applying group: %s -> %s\n", group, sdPath);
+    LOG_IF(LOG_MQTT, "[MQTT] Applying group: %s -> %s\n", group, sdPath);
     sd_mkdir("/config");
 
     // Đọc config hiện tại từ SD
@@ -54,9 +57,9 @@ static void applyServerGroup(JsonDocument& serverDoc, const char* group, const c
     String existingJson = sd_read_file(sdPath);
     if (existingJson.length() > 0) {
         deserializeJson(existing, existingJson);
-        Serial.printf("[MQTT]   Existing config loaded (%d bytes)\n", existingJson.length());
+        LOG_IF(LOG_MQTT, "[MQTT]   Existing config loaded (%d bytes)\n", existingJson.length());
     } else {
-        Serial.println("[MQTT]   No existing config, creating new");
+        LOGLN_IF(LOG_MQTT, "[MQTT]   No existing config, creating new");
     }
 
     if (isDynamic) {
@@ -89,12 +92,12 @@ static void applyServerGroup(JsonDocument& serverDoc, const char* group, const c
             JsonObject src = kv.value().as<JsonObject>();
             JsonObject ch = channels.add<JsonObject>();
             ch["name"] = vName;
-            Serial.printf("[MQTT]   + Channel: %s\n", vName.c_str());
+            LOG_IF(LOG_MQTT, "[MQTT]   + Channel: %s\n", vName.c_str());
             ch["slave_id"] = src["slave_id"];
             ch["register"] = src["register"];
-            ch["fc"] = src["function_code"];
+            ch["function_code"] = src["function_code"];
             ch["data_type"] = src["data_type"];
-            ch["byte_order"] = src["byte_order"];
+            ch["register_order"] = src["register_order"];
             ch["calc_mode"] = src["calc_mode"];
             ch["weight"] = src["weight"];
             ch["x1"] = src["x1"];
@@ -116,7 +119,7 @@ static void applyServerGroup(JsonDocument& serverDoc, const char* group, const c
         
         // Merge: cập nhật channel được gửi, giữ nguyên channel không đề cập
         for (JsonPair kv : serverGroup) {
-            Serial.printf("[MQTT]   + Channel: %s\n", kv.key().c_str());
+            LOG_IF(LOG_MQTT, "[MQTT]   + Channel: %s\n", kv.key().c_str());
             JsonObject ch = channels[kv.key()].to<JsonObject>();
             JsonObject src = kv.value().as<JsonObject>();
             ch["enabled"] = true;
@@ -133,9 +136,9 @@ static void applyServerGroup(JsonDocument& serverDoc, const char* group, const c
     String output;
     serializeJson(existing, output);
     if (sd_write_file(sdPath, output.c_str())) {
-        Serial.printf("[MQTT] Saved %s (%d bytes)\n", sdPath, output.length());
+        LOG_IF(LOG_MQTT, "[MQTT] Saved %s (%d bytes)\n", sdPath, output.length());
     } else {
-        Serial.printf("[MQTT] FAILED to save %s\n", sdPath);
+        LOG_IF(LOG_MQTT, "[MQTT] FAILED to save %s\n", sdPath);
     }
 }
 
@@ -145,7 +148,7 @@ static void applyServerGroup(JsonDocument& serverDoc, const char* group, const c
 static void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // Giới hạn payload 4KB tránh tràn RAM
     if (length > 4096) {
-        Serial.println("[MQTT] Payload quá lớn, bỏ qua");
+        LOGLN_IF(LOG_MQTT, "[MQTT] Payload quá lớn, bỏ qua");
         return;
     }
 
@@ -155,8 +158,8 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
         msg += (char)payload[i];
     }
 
-    Serial.printf("[MQTT] Nhận <- %s (%u bytes)\n", topic, length);
-    Serial.printf("[MQTT] Payload: %.200s%s\n", msg.c_str(), length > 200 ? "..." : "");
+    LOG_IF(LOG_MQTT, "[MQTT] Nhận <- %s (%u bytes)\n", topic, length);
+    LOG_IF(LOG_MQTT, "[MQTT] Payload: %.200s%s\n", msg.c_str(), length > 200 ? "..." : "");
 
     String topicStr(topic);
 
@@ -168,7 +171,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
                 // Tạo timestamp đơn giản (millis-based, chưa có NTP)
                 String pong = "{\"pong\":true,\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                 mqtt.publish(topic_status.c_str(), pong.c_str(), false);
-                Serial.println("[MQTT] Pong sent");
+                LOGLN_IF(LOG_MQTT, "[MQTT] Pong sent");
             }
         }
         return;
@@ -180,10 +183,10 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (!deserializeJson(doc, msg)) {
             const char* cmd = doc["cmd"];
             if (!cmd) return;
-            Serial.printf("[MQTT] CMD: %s\n", cmd);
+            LOG_IF(LOG_MQTT, "[MQTT] CMD: %s\n", cmd);
 
             if (strcmp(cmd, "reset") == 0) {
-                Serial.println("[MQTT] CMD reset -> restarting...");
+                LOGLN_IF(LOG_MQTT, "[MQTT] CMD reset -> restarting...");
                 String ack = "{\"cmd\":\"reset\",\"ack\":true,\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                 mqtt.publish(topic_status.c_str(), ack.c_str(), false);
                 delay(500);
@@ -203,7 +206,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
                     serializeJson(netDoc, output);
                     sd_mkdir("/config");
                     sd_write_file("/config/network.json", output.c_str());
-                    Serial.printf("[MQTT] CMD set_wifi: %s -> saved\n", ssid);
+                    LOG_IF(LOG_MQTT, "[MQTT] CMD set_wifi: %s -> saved\n", ssid);
                     // ACK
                     String ack = "{\"cmd\":\"set_wifi\",\"ack\":true,\"ssid\":\"" + String(ssid) + "\",\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                     mqtt.publish(topic_status.c_str(), ack.c_str(), false);
@@ -222,13 +225,23 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
                     serializeJson(netDoc, output);
                     sd_mkdir("/config");
                     sd_write_file("/config/network.json", output.c_str());
-                    Serial.printf("[MQTT] CMD set_mqtt: %s:%d -> saved\n", host, port);
+                    LOG_IF(LOG_MQTT, "[MQTT] CMD set_mqtt: %s:%d -> saved\n", host, port);
                     String ack = "{\"cmd\":\"set_mqtt\",\"ack\":true,\"host\":\"" + String(host) + "\",\"port\":" + String(port) + ",\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                     mqtt.publish(topic_status.c_str(), ack.c_str(), false);
                 }
             }
+            else if (strcmp(cmd, "ota_update") == 0) {
+                const char* url = doc["url"];
+                const char* checksum = doc["checksum"];
+                if (url && strlen(url) > 0) {
+                    LOG_IF(LOG_MQTT, "[MQTT] CMD ota_update: %s\n", url);
+                    ota_start(String(url), checksum ? String(checksum) : "");
+                } else {
+                    LOGLN_IF(LOG_MQTT, "[MQTT] CMD ota_update: missing url");
+                }
+            }
             else {
-                Serial.printf("[MQTT] CMD unknown: %s\n", cmd);
+                LOG_IF(LOG_MQTT, "[MQTT] CMD unknown: %s\n", cmd);
             }
         }
         return;
@@ -242,13 +255,13 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
             if (doc["source"] == "device") return;
 
             if (doc["source"] == "server") {
-                Serial.println("[MQTT] Config từ server nhận được");
+                LOGLN_IF(LOG_MQTT, "[MQTT] Config từ server nhận được");
 
                 // Đọc mode — debug là biến động, không lưu SD
                 if (doc["mode"].is<JsonObject>()) {
                     bool dbg = doc["mode"]["debug"] | false;
                     data_collector_set_debug(dbg);
-                    Serial.printf("[MQTT] Debug mode: %s\n", dbg ? "ON" : "OFF");
+                    LOG_IF(LOG_MQTT, "[MQTT] Debug mode: %s\n", dbg ? "ON" : "OFF");
                 }
 
                 // Cập nhật từng group vào SD
@@ -262,7 +275,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
                 // Gửi ACK nhỏ gọn (không echo full config → tránh loop)
                 String ack = "{\"source\":\"device\",\"ack\":true,\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                 mqtt.publish(topic_config.c_str(), ack.c_str(), false);
-                Serial.println("[MQTT] Config applied, ACK sent");
+                LOGLN_IF(LOG_MQTT, "[MQTT] Config applied, ACK sent");
 
                 // Notify data_collector to reload calc configs
                 if (onConfigChanged) onConfigChanged();
@@ -275,13 +288,13 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // Build config string từ tất cả config trên SD (format gốc, 1 JSON)
 // ============================================================
 static String buildDeviceConfig() {
-    Serial.println("[MQTT] Building device config from SD...");
+    LOGLN_IF(LOG_MQTT, "[MQTT] Building device config from SD...");
     JsonDocument doc;
     doc["source"] = "device";
 
     // Analog
-    String analogJson = sd_read_file("/config/analog.json");
-    Serial.printf("[MQTT]   analog.json: %d bytes\n", analogJson.length());
+    String analogJson = sd_exists("/config/analog.json") ? sd_read_file("/config/analog.json") : "";
+    LOG_IF(LOG_MQTT, "[MQTT]   analog.json: %d bytes\n", analogJson.length());
     if (analogJson.length() > 0) {
         JsonDocument aCfg;
         if (!deserializeJson(aCfg, analogJson)) {
@@ -303,8 +316,8 @@ static String buildDeviceConfig() {
     }
 
     // Encoder
-    String encJson = sd_read_file("/config/encoder.json");
-    Serial.printf("[MQTT]   encoder.json: %d bytes\n", encJson.length());
+    String encJson = sd_exists("/config/encoder.json") ? sd_read_file("/config/encoder.json") : "";
+    LOG_IF(LOG_MQTT, "[MQTT]   encoder.json: %d bytes\n", encJson.length());
     if (encJson.length() > 0) {
         JsonDocument eCfg;
         if (!deserializeJson(eCfg, encJson)) {
@@ -326,8 +339,8 @@ static String buildDeviceConfig() {
     }
 
     // DI
-    String diJson = sd_read_file("/config/di.json");
-    Serial.printf("[MQTT]   di.json: %d bytes\n", diJson.length());
+    String diJson = sd_exists("/config/di.json") ? sd_read_file("/config/di.json") : "";
+    LOG_IF(LOG_MQTT, "[MQTT]   di.json: %d bytes\n", diJson.length());
     if (diJson.length() > 0) {
         JsonDocument dCfg;
         if (!deserializeJson(dCfg, diJson)) {
@@ -349,8 +362,8 @@ static String buildDeviceConfig() {
     }
 
     // RS485
-    String rs485Json = sd_read_file("/config/rs485.json");
-    Serial.printf("[MQTT]   rs485.json: %d bytes\n", rs485Json.length());
+    String rs485Json = sd_exists("/config/rs485.json") ? sd_read_file("/config/rs485.json") : "";
+    LOG_IF(LOG_MQTT, "[MQTT]   rs485.json: %d bytes\n", rs485Json.length());
     if (rs485Json.length() > 0) {
         JsonDocument rCfg;
         if (!deserializeJson(rCfg, rs485Json)) {
@@ -372,9 +385,9 @@ static String buildDeviceConfig() {
                         ch["y2"] = src["y2"];
                         ch["slave_id"] = src["slave_id"];
                         ch["register"] = src["register"];
-                        ch["function_code"] = src["fc"];
+                        ch["function_code"] = src["function_code"];
                         ch["data_type"] = src["data_type"];
-                        ch["byte_order"] = src["byte_order"];
+                        ch["register_order"] = src["register_order"];
                     }
                 }
             }
@@ -396,9 +409,9 @@ static String buildDeviceConfig() {
                         ch["y2"] = src["y2"];
                         ch["slave_id"] = src["slave_id"];
                         ch["register"] = src["register"];
-                        ch["function_code"] = src["fc"];
+                        ch["function_code"] = src["function_code"];
                         ch["data_type"] = src["data_type"];
-                        ch["byte_order"] = src["byte_order"];
+                        ch["register_order"] = src["register_order"];
                     }
                 }
             }
@@ -406,8 +419,8 @@ static String buildDeviceConfig() {
     }
 
     // TCP
-    String tcpJson = sd_read_file("/config/tcp.json");
-    Serial.printf("[MQTT]   tcp.json: %d bytes\n", tcpJson.length());
+    String tcpJson = sd_exists("/config/tcp.json") ? sd_read_file("/config/tcp.json") : "";
+    LOG_IF(LOG_MQTT, "[MQTT]   tcp.json: %d bytes\n", tcpJson.length());
     if (tcpJson.length() > 0) {
         JsonDocument tCfg;
         if (!deserializeJson(tCfg, tcpJson)) {
@@ -426,9 +439,9 @@ static String buildDeviceConfig() {
                     ch["y2"] = src["y2"];
                     ch["slave_id"] = src["slave_id"];
                     ch["register"] = src["register"];
-                    ch["function_code"] = src["fc"];
+                    ch["function_code"] = src["function_code"];
                     ch["data_type"] = src["data_type"];
-                    ch["byte_order"] = src["byte_order"];
+                    ch["register_order"] = src["register_order"];
                     ch["host"] = src["ip"];
                     ch["port"] = src["port"];
                 }
@@ -438,19 +451,19 @@ static String buildDeviceConfig() {
 
     String output;
     serializeJson(doc, output);
-    Serial.printf("[MQTT] Device config built: %d bytes\n", output.length());
+    LOG_IF(LOG_MQTT, "[MQTT] Device config built: %d bytes\n", output.length());
     return output;
 }
 
 // Publish payload lớn bằng streaming (vượt buffer limit)
 static bool mqttPublishLarge(const char* topic, const String& payload) {
     if (!mqtt.beginPublish(topic, payload.length(), false)) {
-        Serial.printf("[MQTT] beginPublish FAILED for %s\n", topic);
+        LOG_IF(LOG_MQTT, "[MQTT] beginPublish FAILED for %s\n", topic);
         return false;
     }
     mqtt.print(payload);
     bool ok = mqtt.endPublish();
-    Serial.printf("[MQTT] Published %s (%d bytes) -> %s\n", topic, payload.length(), ok ? "OK" : "FAIL");
+    LOG_IF(LOG_MQTT, "[MQTT] Published %s (%d bytes) -> %s\n", topic, payload.length(), ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -459,24 +472,25 @@ static bool mqttPublishLarge(const char* topic, const String& payload) {
 // ============================================================
 static bool mqttConnect() {
     String clientId = cfg_device_id + "-fw";
-    Serial.printf("[MQTT] Kết nối %s:%d (user=%s)...\n",
+    LOG_IF(LOG_MQTT, "[MQTT] Kết nối %s:%d (user=%s)...\n",
         cfg_broker.c_str(), cfg_port, cfg_device_id.c_str());
 
     if (mqtt.connect(clientId.c_str(), cfg_device_id.c_str(), cfg_mqtt_pass.c_str())) {
-        Serial.println("[MQTT] Connected!");
+        LOGLN_IF(LOG_MQTT, "[MQTT] Connected!");
 
         // Subscribe
         mqtt.subscribe(topic_config.c_str(), 1);
         mqtt.subscribe(topic_status.c_str(), 1);
         mqtt.subscribe(topic_cmd.c_str(), 1);
-        Serial.printf("[MQTT] Subscribed: %s\n", topic_config.c_str());
-        Serial.printf("[MQTT] Subscribed: %s\n", topic_status.c_str());
-        Serial.printf("[MQTT] Subscribed: %s\n", topic_cmd.c_str());
+        LOG_IF(LOG_MQTT, "[MQTT] Subscribed: %s\n", topic_config.c_str());
+        LOG_IF(LOG_MQTT, "[MQTT] Subscribed: %s\n", topic_status.c_str());
+        LOG_IF(LOG_MQTT, "[MQTT] Subscribed: %s\n", topic_cmd.c_str());
 
         justConnected = true;
         return true;
     } else {
-        Serial.printf("[MQTT] Lỗi kết nối, rc=%d\n", mqtt.state());
+        LOG_IF(LOG_MQTT, "[MQTT] Lỗi kết nối, rc=%d\n", mqtt.state());
+        err_log("MQTT", "Connect FAILED rc=" + String(mqtt.state()));
         return false;
     }
 }
@@ -488,13 +502,13 @@ static bool mqttConnect() {
 bool mqtt_init() {
     String json = sd_read_file("/config/network.json");
     if (json.length() == 0) {
-        Serial.println("[MQTT] Không tìm thấy config network");
+        LOGLN_IF(LOG_MQTT, "[MQTT] Không tìm thấy config network");
         return false;
     }
 
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
-        Serial.println("[MQTT] Config JSON lỗi");
+        LOGLN_IF(LOG_MQTT, "[MQTT] Config JSON lỗi");
         return false;
     }
 
@@ -504,7 +518,7 @@ bool mqtt_init() {
     cfg_mqtt_pass = doc["mqtt_pass"].as<String>();
 
     if (cfg_broker.length() == 0 || cfg_device_id.length() == 0) {
-        Serial.println("[MQTT] Thiếu broker hoặc device_id");
+        LOGLN_IF(LOG_MQTT, "[MQTT] Thiếu broker hoặc device_id");
         return false;
     }
 
@@ -520,15 +534,23 @@ bool mqtt_init() {
     mqtt.setCallback(mqttCallback);
     mqtt.setKeepAlive(60);
 
-    Serial.printf("[MQTT] Init OK: %s:%d device=%s\n",
+    LOG_IF(LOG_MQTT, "[MQTT] Init OK: %s:%d device=%s\n",
         cfg_broker.c_str(), cfg_port, cfg_device_id.c_str());
     return true;
 }
+
+// Track trạng thái kết nối để phát hiện lúc vừa mất kết nối
+static bool _wasMqttConnected = false;
 
 void mqtt_update() {
     if (WiFi.status() != WL_CONNECTED) return;
 
     if (!mqtt.connected()) {
+        // Phát hiện vừa mất kết nối
+        if (_wasMqttConnected) {
+            _wasMqttConnected = false;
+            err_log("MQTT", "Disconnected (rc=" + String(mqtt.state()) + ")");
+        }
         unsigned long now = millis();
         if (now - lastReconnectAttempt > RECONNECT_INTERVAL) {
             lastReconnectAttempt = now;
@@ -538,6 +560,7 @@ void mqtt_update() {
             }
         }
     } else {
+        _wasMqttConnected = true;
         mqtt.loop();
 
         // Sau khi vừa kết nối: gửi online + config
@@ -554,10 +577,17 @@ void mqtt_update() {
             statusDoc["mqtt_host"] = cfg_broker;
             statusDoc["mqtt_port"] = cfg_port;
             statusDoc["fw_version"] = FW_VERSION;
+
+            // Nếu vừa OTA xong → thêm ota_status done
+            if (ota_check_just_updated()) {
+                statusDoc["ota_status"]   = "done";
+                statusDoc["ota_progress"] = 100;
+            }
+
             String statusMsg;
             serializeJson(statusDoc, statusMsg);
             mqtt.publish(topic_status.c_str(), statusMsg.c_str(), false);
-            Serial.println("[MQTT] Published: online status");
+            LOGLN_IF(LOG_MQTT, "[MQTT] Published: online status");
 
             // Publish device config (streaming — không giới hạn bởi buffer)
             String cfgMsg = buildDeviceConfig();
@@ -572,34 +602,40 @@ bool mqtt_is_connected() {
 
 bool mqtt_publish_data(const String& json) {
     if (!mqtt.connected()) {
-        Serial.println("[MQTT] publish_data FAILED: not connected");
+        LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAILED: not connected");
         return false;
     }
     bool ok = mqtt.publish(topic_data.c_str(), json.c_str(), false);
-    Serial.printf("[MQTT] Published data (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
+    LOG_IF(LOG_MQTT, "[MQTT] Published data (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
     return ok;
 }
 
 bool mqtt_publish_status(const String& json) {
     if (!mqtt.connected()) {
-        Serial.println("[MQTT] publish_status FAILED: not connected");
+        LOGLN_IF(LOG_MQTT, "[MQTT] publish_status FAILED: not connected");
         return false;
     }
     bool ok = mqtt.publish(topic_status.c_str(), json.c_str(), false);
-    Serial.printf("[MQTT] Published status (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
+    LOG_IF(LOG_MQTT, "[MQTT] Published status (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
     return ok;
 }
 
 bool mqtt_publish_config(const String& json) {
     if (!mqtt.connected()) {
-        Serial.println("[MQTT] publish_config FAILED: not connected");
+        LOGLN_IF(LOG_MQTT, "[MQTT] publish_config FAILED: not connected");
         return false;
     }
     bool ok = mqtt.publish(topic_config.c_str(), json.c_str(), false);
-    Serial.printf("[MQTT] Published config (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
+    LOG_IF(LOG_MQTT, "[MQTT] Published config (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
     return ok;
 }
 
 void mqtt_set_config_callback(void (*cb)()) {
     onConfigChanged = cb;
+}
+
+void mqtt_keep_alive() {
+    if (mqtt.connected()) {
+        mqtt.loop();
+    }
 }

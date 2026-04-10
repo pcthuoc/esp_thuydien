@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <vector>
 
 // --- Pin mapping SDMMC (từ schematic) ---
 #define SD_MMC_CLK   11
@@ -20,3 +21,7 @@ bool sd_remove(const char* path);
 bool sd_mkdir(const char* path);
 uint64_t sd_total_bytes();
 uint64_t sd_used_bytes();
+
+// Liệt kê tên file/thư mục trong một thư mục (không đệ quy, đã sắp xếp tăng dần)
+std::vector<String> sd_list_dir(const char* path);
+bool sd_rmdir(const char* path);

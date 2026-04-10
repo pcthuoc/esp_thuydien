@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-#define MODBUS_MAX_CHANNELS  10  // Tối đa 10 kênh mỗi bus
+#define MODBUS_MAX_CHANNELS  20  // Tối đa 20 kênh mỗi bus (5 slave × 4 biến)
 
 // --- Data types ---
 enum MbDataType : uint8_t {

@@ -22,3 +22,6 @@ bool mqtt_publish_config(const String& json);
 
 // Set callback khi server gửi config mới (để reload calc config)
 void mqtt_set_config_callback(void (*cb)());
+
+// Gọi mqtt.loop() để giữ kết nối (dùng trong OTA)
+void mqtt_keep_alive();

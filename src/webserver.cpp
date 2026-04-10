@@ -1,5 +1,10 @@
 #include "webserver.h"
 #include "sd_card.h"
+#include "analog_reader.h"
+#include "counter.h"
+#include "rain_gauge.h"
+#include "modbus_rtu.h"
+#include "modbus_tcp.h"
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
@@ -156,12 +161,60 @@ static void api_clear_config(AsyncWebServerRequest* request) {
 }
 
 // ============================================================
+// API: GET /api/debug/raw?group=analog|encoder|di|rs485|tcp
+// ============================================================
+static void api_debug_raw(AsyncWebServerRequest* request) {
+    String group = request->hasParam("group") ? request->getParam("group")->value() : "";
+    JsonDocument doc;
+
+    if (group == "analog") {
+        if (analog_ads1_ok() || analog_ads2_ok()) {
+            analog_poll();
+            for (uint8_t i = 0; i < ANALOG_CHANNELS; i++) {
+                char key[4]; snprintf(key, sizeof(key), "A%d", i + 1);
+                const AnalogChannel* ch = analog_get_channel(i);
+                if (ch && ch->valid) doc[key] = ch->raw_count;
+                else doc[key] = (char*)nullptr;
+            }
+        }
+    } else if (group == "encoder") {
+        doc["E1"] = counter_get(0);
+        doc["E2"] = counter_get(1);
+    } else if (group == "di") {
+        doc["DI1"] = rain_get_count();
+    } else if (group == "rs485") {
+        modbus_rtu_poll();
+        uint8_t n = modbus_rtu_channel_count();
+        for (uint8_t i = 0; i < n; i++) {
+            const MbChannel* mch = modbus_rtu_get_channel(i);
+            if (!mch) continue;
+            if (mch->valid) doc[mch->name] = mch->value;
+            else doc[mch->name] = (char*)nullptr;
+        }
+    } else if (group == "tcp") {
+        modbus_tcp_poll();
+        uint8_t n = modbus_tcp_channel_count();
+        for (uint8_t i = 0; i < n; i++) {
+            const TcpChannel* tch = modbus_tcp_get_channel(i);
+            if (!tch) continue;
+            if (tch->valid) doc[tch->name] = tch->value;
+            else doc[tch->name] = (char*)nullptr;
+        }
+    }
+
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+}
+
+// ============================================================
 // Setup routes
 // ============================================================
 static void setup_routes() {
     // --- API ---
     server.on("/api/status", HTTP_GET, api_status);
     server.on("/api/scan",   HTTP_GET, api_scan);
+    server.on("/api/debug/raw", HTTP_GET, api_debug_raw);
 
     // Config GET/POST with path param
     server.on("/api/config/network",   HTTP_GET, api_get_config);

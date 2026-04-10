@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
+#include "version.h"
 #include "led_status.h"
 #include "sd_card.h"
 #include "button.h"
@@ -13,6 +14,8 @@
 #include "modbus_rtu.h"
 #include "modbus_tcp.h"
 #include "data_collector.h"
+#include "ota_update.h"
+#include "error_log.h"
 
 // --- WiFi reconnect ---
 static bool wifiConfigured = false;    // có config WiFi trên SD
@@ -138,14 +141,16 @@ void setup() {
     led_init();
     led_set_state(LedState::BOOTING);
 
-    Serial.println("\n[BOOT] Khởi động...");
-
-    // Init SD card
+    // Init SD trước — để err_log ghi được từ đầu
     if (sd_init()) {
         Serial.println("[BOOT] SD card OK");
     } else {
         Serial.println("[BOOT] SD card FAIL");
     }
+
+    Serial.println("\n[BOOT] Khởi động...");
+    Serial.println("[BOOT] Firmware version: " FW_VERSION);
+    err_log("BOOT", "Device started, fw=" FW_VERSION);
 
     // Init Button
     button_init();
@@ -222,11 +227,18 @@ void setup() {
         Serial.println("[BOOT] Modbus RTU: no config");
     }
 
-    // Init Modbus TCP (W5500)
+    // Init W5500 hardware (luôn gọi, không phụ thuộc config)
+    if (w5500_init()) {
+        Serial.println("[BOOT] W5500 OK");
+    } else {
+        Serial.println("[BOOT] W5500 not found");
+    }
+
+    // Load Modbus TCP channels từ SD (cần W5500 đã init trước)
     if (modbus_tcp_init()) {
         Serial.printf("[BOOT] Modbus TCP OK (%d channels)\n", modbus_tcp_channel_count());
     } else {
-        Serial.println("[BOOT] Modbus TCP: no config or W5500 not found");
+        Serial.println("[BOOT] Modbus TCP: no config");
     }
 
     // MQTT config callback → data_collector reload
@@ -243,10 +255,19 @@ void loop() {
     led_update();
     button_update();
 
-    // AP mode → dừng mọi hoạt động đọc dữ liệu và gửi
-    if (webserver_is_running()) return;
+    // AP mode → ưu tiên LED + dừng mọi hoạt động đọc dữ liệu và gửi
+    if (webserver_is_running()) {
+        if (led_get_state() != LedState::CONFIG_AP_MODE)
+            led_set_state(LedState::CONFIG_AP_MODE);
+        return;
+    }
 
     mqtt_update();
+    ota_loop();
+
+    // OTA đang chạy → dừng đọc sensor, chỉ giữ MQTT
+    if (ota_in_progress()) return;
+
     ntp_rtc_update();
     rain_update();
     data_collector_update();
@@ -258,6 +279,7 @@ void loop() {
             lastWifiCheck = now;
             if (WiFi.status() != WL_CONNECTED) {
                 Serial.println("[WIFI] Disconnected! Reconnecting...");
+                err_log("WIFI", "Disconnected — attempting reconnect");
                 led_set_state(LedState::WIFI_CONNECTING);
                 WiFi.reconnect();
 
@@ -273,6 +295,7 @@ void loop() {
 
                 if (WiFi.status() == WL_CONNECTED) {
                     Serial.printf("[WIFI] Reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
+                    err_log("WIFI", "Reconnected IP=" + WiFi.localIP().toString());
 
                     // Init MQTT lần đầu nếu chưa
                     if (!mqttInited) {
@@ -286,6 +309,7 @@ void loop() {
                     led_set_state(LedState::MQTT_CONNECTING);
                 } else {
                     Serial.println("[WIFI] Reconnect failed, will retry...");
+                    err_log("WIFI", "Reconnect FAILED");
                     led_set_state(LedState::OFFLINE_BUFFERING);
                 }
             }

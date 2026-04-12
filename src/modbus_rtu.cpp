@@ -160,8 +160,32 @@ static void loadBusConfig(MbBus& bus, JsonObject busObj) {
 }
 
 // ============================================================
+// TD301D485H-A auto-flow: flush echo sau khi TX
+// postTransmission gọi sau khi gửi xong, trước khi đọc response
+// ============================================================
+static void bus1PostTransmission() {
+    BUS1_SERIAL.flush();           // chờ TX hoàn tất
+    while (BUS1_SERIAL.available()) BUS1_SERIAL.read();  // xả echo
+}
+
+// ============================================================
 // Đọc 1 channel bằng ModbusMaster
 // ============================================================
+
+static const char* modbusErrStr(uint8_t code) {
+    switch (code) {
+        case 0xE0: return "RESPONSE_TIMEOUT";
+        case 0xE1: return "INVALID_SLAVE_ID";
+        case 0xE2: return "INVALID_FUNCTION";
+        case 0xE3: return "RESPONSE_TOO_LONG";
+        case 0xE4: return "CRC_ERROR";
+        case 0x01: return "EX_ILLEGAL_FUNCTION";
+        case 0x02: return "EX_ILLEGAL_ADDRESS";
+        case 0x03: return "EX_ILLEGAL_VALUE";
+        case 0x04: return "EX_SLAVE_FAILURE";
+        default:   return "UNKNOWN";
+    }
+}
 
 static bool readChannel(ModbusMaster& node, HardwareSerial& serial,
                         MbChannel& ch) {
@@ -171,6 +195,9 @@ static bool readChannel(ModbusMaster& node, HardwareSerial& serial,
     uint16_t qty = (ch.data_type >= MB_INT32) ? 2 : 1;
     uint8_t result;
 
+    LOG_IF(LOG_MODBUS, "[MODBUS] >> %s | slave=%d FC=%02d reg=%d qty=%d\n",
+           ch.name, ch.slave_id, ch.fc, ch.reg_addr, qty);
+
     if (ch.fc == 4) {
         result = node.readInputRegisters(ch.reg_addr, qty);
     } else {
@@ -179,18 +206,21 @@ static bool readChannel(ModbusMaster& node, HardwareSerial& serial,
 
     if (result != node.ku8MBSuccess) {
         ch.valid = false;
-        LOG_IF(LOG_MODBUS, "[MODBUS] %s err=0x%02X (slave=%d reg=%d fc=%d)\n",
-               ch.name, result, ch.slave_id, ch.reg_addr, ch.fc);
+        LOG_IF(LOG_MODBUS, "[MODBUS] !! %s FAIL 0x%02X (%s)\n",
+               ch.name, result, modbusErrStr(result));
         return false;
     }
 
     uint16_t regs[2] = {0, 0};
     for (uint16_t i = 0; i < qty; i++) {
         regs[i] = node.getResponseBuffer(i);
+        LOG_IF(LOG_MODBUS, "[MODBUS]    reg[%d] = 0x%04X (%u)\n", i, regs[i], regs[i]);
     }
 
     ch.value = convertValue(regs, ch.data_type, ch.byte_order);
     ch.valid = true;
+    LOG_IF(LOG_MODBUS, "[MODBUS] << %s = %.4f (dt=%d bo=%d)\n",
+           ch.name, ch.value, ch.data_type, ch.byte_order);
     return true;
 }
 
@@ -227,6 +257,8 @@ bool modbus_rtu_init() {
     // Init UART Bus 1
     BUS1_SERIAL.begin(bus1.baud, serialConfig(bus1.parity), BUS1_RX, BUS1_TX);
     node1.begin(1, BUS1_SERIAL);
+    // TD301D485H-A auto-flow: flush echo bytes sau TX, trước khi đọc response
+    node1.postTransmission(bus1PostTransmission);
     LOG_IF(LOG_MODBUS, "[MODBUS] Bus1 init: %lu 8%c1, %d channels\n",
                   bus1.baud,
                   bus1.parity == 1 ? 'E' : (bus1.parity == 2 ? 'O' : 'N'),

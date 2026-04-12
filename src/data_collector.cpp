@@ -396,7 +396,7 @@ static void doPublish() {
         ch["real"] = real;
     }
 
-    // ---- RS485 Bus 1 (giá trị cache từ lần poll gần nhất) ----
+    // ---- RS485 Bus 1 (giá trị cache từ lần poll gần nhất) ---- 
     uint8_t rtuN = rtuActive ? modbus_rtu_channel_count() : 0;
     if (rtuN > 0) {
         JsonObject grp = doc["rs485_1"].to<JsonObject>();

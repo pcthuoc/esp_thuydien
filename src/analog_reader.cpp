@@ -8,12 +8,15 @@
 // ============================================================
 
 // ADS1115 #1 — Current (ADDR = GND → 0x48)
-// Input: 0-20mA (24VDC loop) hoặc 4-20mA
-// Shunt: 100Ω (1kΩ series protection, negligible với ADS input impedance)
-// V_ain = I × 100Ω → max 20mA = 2.0V (trong range GAIN_ONE ±4.096V)
-// I(mA) = V_ain(V) / R_shunt × 1000 = V_ain(V) × 10
+// Input: 0-20mA, AIN connector mắc ngang qua R_ext (100Ω ngoài)
+// R_ext || (R220+R224) là tải tại node A:
+//   V_ain = I × (R_ext*(R220+R224)/(R_ext+R220+R224)) × R224/(R220+R224)
+//   I(mA) = V_ain × (R_ext + R220 + R224) / (R_ext × R224) × 1000
+// Tại 20mA: V_A=1.833V → V_ain=0.1667V → I=0.1667×120=20mA ✓
 #define ADS1_ADDR           0x48
-#define SHUNT_RESISTANCE    100.0f    // 100Ω
+#define R_EXT_SHUNT         100.0f   // Điện trở shunt ngoài (Ω)
+#define R_SERIES            1000.0f  // R220 series protection (Ω)
+#define R_PCB_SHUNT         100.0f   // R224 shunt PCB xuống GND (Ω)
 
 // ADS1115 #2 — Voltage (ADDR = VDD → 0x49)
 // Input: 0-10V
@@ -78,7 +81,8 @@ void analog_poll() {
 
             channels[i].raw_count = raw;
             channels[i].raw_adc = v_ain * 1000.0f;  // mV
-            channels[i].value = (v_ain / SHUNT_RESISTANCE) * 1000.0f;  // mA
+            // I(mA) = V_ain × (R_EXT + R_SERIES + R_PCB) / (R_EXT × R_PCB) × 1000
+            channels[i].value = v_ain * (R_EXT_SHUNT + R_SERIES + R_PCB_SHUNT) / (R_EXT_SHUNT * R_PCB_SHUNT) * 1000.0f;
             channels[i].valid = true;
             LOG_IF(LOG_ADS, "[ADS] A%d: raw=%d  adc=%.1fmV  curr=%.3fmA\n",
                           i + 1, raw, v_ain * 1000.0f, channels[i].value);

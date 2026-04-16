@@ -114,9 +114,11 @@ async function pageHome() {
     content.innerHTML = '<h2>📊 Trang chủ</h2><div class="status-grid" id="statusGrid">Đang tải...</div>';
     try {
         const d = await apiGet('/api/status');
+        const modeLabel = {'wifi':'WiFi Only','4g':'4G Only','auto':'Auto (WiFi+4G)'}[d.net_mode] || 'WiFi Only';
         $('#statusGrid').innerHTML = `
             <div class="status-item"><div class="label">Uptime</div><div class="value">${formatUptime(d.uptime)}</div></div>
             <div class="status-item"><div class="label">Free Heap</div><div class="value">${(d.free_heap/1024).toFixed(0)} KB</div></div>
+            <div class="status-item"><div class="label">Chế độ mạng</div><div class="value">${modeLabel}</div></div>
             <div class="status-item"><div class="label">WiFi</div><div class="value">${d.wifi_mode}</div></div>
             <div class="status-item"><div class="label">IP</div><div class="value">${d.ip}</div></div>
             <div class="status-item"><div class="label">SD Tổng</div><div class="value">${d.sd_total_mb} MB</div></div>
@@ -202,10 +204,61 @@ async function pageNetwork() {
                 </div>
             </div>
         </div>
+        <div class="card">
+            <h3>📶 4G / SIM</h3>
+            <div class="form-group">
+                <label>Chế độ kết nối</label>
+                <select id="net_mode">
+                    <option value="wifi" ${!cfg.net_mode||cfg.net_mode==='wifi'?'selected':''}>WiFi Only</option>
+                    <option value="4g" ${cfg.net_mode==='4g'?'selected':''}>4G Only</option>
+                    <option value="auto" ${cfg.net_mode==='auto'?'selected':''}>Auto (WiFi ưu tiên, fallback 4G)</option>
+                </select>
+                <small style="color:#aaa;display:block;margin-top:4px">Auto: kết nối WiFi trước, mất WiFi tự chuyển sang 4G</small>
+            </div>
+            <div class="form-group">
+                <label>Nhà mạng (chọn để điền APN tự động)</label>
+                <div style="display:flex;gap:8px">
+                    <select id="sim_carrier" onchange="applyCarrierPreset()" style="flex:1">
+                        <option value="custom" ${!cfg.carrier||cfg.carrier==='custom'?'selected':''}>-- Tùy chỉnh --</option>
+                        <option value="viettel" ${cfg.carrier==='viettel'?'selected':''}>Viettel</option>
+                        <option value="vinaphone" ${cfg.carrier==='vinaphone'?'selected':''}>VinaPhone (VNPT)</option>
+                        <option value="mobifone" ${cfg.carrier==='mobifone'?'selected':''}>MobiFone</option>
+                        <option value="vietnamobile" ${cfg.carrier==='vietnamobile'?'selected':''}>Vietnamobile</option>
+                        <option value="reddi" ${cfg.carrier==='reddi'?'selected':''}>Reddi (Indochina)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>APN</label>
+                    <input id="sim_apn" value="${cfg.apn || ''}" placeholder="v-internet">
+                </div>
+                <div class="form-group">
+                    <label>SIM PIN (để trống nếu không có)</label>
+                    <input id="sim_pin" value="${cfg.sim_pin || ''}" placeholder="">
+                </div>
+            </div>
+        </div>
         <div class="btn-group">
             <button class="btn btn-primary" onclick="saveNetwork()">💾 Lưu</button>
         </div>
     `;
+}
+
+const CARRIER_PRESETS = {
+    viettel:      { apn: 'v-internet' },
+    vinaphone:    { apn: 'internet' },
+    mobifone:     { apn: 'm-wap' },
+    vietnamobile: { apn: 'internet' },
+    reddi:        { apn: 'internet' },
+};
+
+function applyCarrierPreset() {
+    const carrier = $('#sim_carrier').value;
+    const preset = CARRIER_PRESETS[carrier];
+    if (preset) {
+        $('#sim_apn').value = preset.apn;
+    }
 }
 
 function togglePass() {
@@ -290,7 +343,11 @@ async function saveNetwork() {
         mqtt_pass: $('#mqtt_pass').value,
         eth_static_ip: $('#eth_static_ip').value.trim(),
         eth_gateway:   $('#eth_gateway').value.trim(),
-        eth_subnet:    $('#eth_subnet').value.trim()
+        eth_subnet:    $('#eth_subnet').value.trim(),
+        net_mode: $('#net_mode').value,
+        carrier:  $('#sim_carrier').value,
+        apn:      $('#sim_apn').value.trim(),
+        sim_pin:  $('#sim_pin').value.trim()
     };
     const res = await apiPost('/api/config/network', data);
     if (res.ok) toast('Đã lưu cấu hình mạng');
@@ -945,7 +1002,6 @@ const pages = {
     di: pageDi,
     rs485: pageRs485,
     tcp: pageTcp,
-    monitor: pageMonitor,
     system: pageSystem,
 };
 

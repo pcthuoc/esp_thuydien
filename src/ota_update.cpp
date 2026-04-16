@@ -2,6 +2,7 @@
 #include "debug_config.h"
 #include "mqtt_client.h"
 #include "ntp_rtc.h"
+#include "modem_4g.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Update.h>
@@ -205,6 +206,11 @@ static void performOTA() {
 void ota_start(const String& url, const String& checksum) {
     if (_running) {
         LOGLN_IF(LOG_OTA, "[OTA] Already running, ignoring");
+        return;
+    }
+    // Không cho OTA qua 4G — tốn data
+    if (modem_4g_is_connected() && WiFi.status() != WL_CONNECTED) {
+        LOGLN_IF(LOG_OTA, "[OTA] BLOCKED — đang dùng 4G, không cho OTA");
         return;
     }
     _url      = url;

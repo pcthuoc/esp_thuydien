@@ -40,6 +40,19 @@ static void api_status(AsyncWebServerRequest* request) {
     doc["wifi_mode"] = "AP";
     doc["ip"] = WiFi.softAPIP().toString();
 
+    // Đọc net_mode từ config để hiển thị trên Home
+    String netJson = sd_read_file("/config/network.json");
+    if (netJson.length() > 0) {
+        JsonDocument netDoc;
+        if (!deserializeJson(netDoc, netJson)) {
+            doc["net_mode"] = netDoc["net_mode"] | "wifi";
+        } else {
+            doc["net_mode"] = "wifi";
+        }
+    } else {
+        doc["net_mode"] = "wifi";
+    }
+
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);

@@ -6,12 +6,24 @@
 #include "data_collector.h"
 #include "ota_update.h"
 #include "error_log.h"
+#include "modem_4g.h"
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
-static WiFiClient wifiClient;
-static PubSubClient mqtt(wifiClient);
+// Default WiFiClient — dùng khi chưa gọi mqtt_set_client()
+static WiFiClient   s_wifiClient;
+static Client*      s_activeClient = &s_wifiClient;
+static PubSubClient mqtt(*s_activeClient);
+
+// Mutex bảo vệ TinyGsmClient/WiFiClient khỏi race condition giữa:
+//   - Core 1: mqtt_update() → mqtt.loop() (read socket + PINGREQ)
+//   - Core 0: backfillTask → mqtt_publish_data() → mqtt.publish() (write socket)
+// Cả 2 core cùng dùng 1 Client → không guard → garbled AT stream → "lid invalid" → drop 4G
+static SemaphoreHandle_t s_mqttMutex = nullptr;
 
 // Config
 static String cfg_broker;
@@ -40,6 +52,23 @@ static void (*onConfigChanged)() = nullptr;
 
 // Forward declarations
 static String buildDeviceConfig();
+
+// ============================================================
+// mqtt_set_client — gọi trước mqtt_init() để dùng transport khác
+// ============================================================
+void mqtt_set_client(Client* client) {
+    if (!client) return;
+    s_activeClient = client;
+    mqtt.setClient(*s_activeClient);
+}
+
+void mqtt_switch_transport(Client* client) {
+    LOG_IF(LOG_MQTT, "[MQTT] switch_transport: ngắt kết nối MQTT để đổi transport...\n");
+    mqtt.disconnect();
+    s_activeClient = client ? client : &s_wifiClient;
+    mqtt.setClient(*s_activeClient);
+    LOG_IF(LOG_MQTT, "[MQTT] Transport đã đổi, mqtt_update() sẽ reconnect.\n");
+}
 
 // ============================================================
 // Apply config group từ server vào SD card
@@ -532,7 +561,9 @@ bool mqtt_init() {
     mqtt.setBufferSize(4096);
     mqtt.setServer(cfg_broker.c_str(), cfg_port);
     mqtt.setCallback(mqttCallback);
-    mqtt.setKeepAlive(60);
+    mqtt.setKeepAlive(30);  // 4G unstable — 30s detect drop nhanh hơn 60s
+
+    if (!s_mqttMutex) s_mqttMutex = xSemaphoreCreateMutex();
 
     LOG_IF(LOG_MQTT, "[MQTT] Init OK: %s:%d device=%s\n",
         cfg_broker.c_str(), cfg_port, cfg_device_id.c_str());
@@ -543,7 +574,9 @@ bool mqtt_init() {
 static bool _wasMqttConnected = false;
 
 void mqtt_update() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    // Cho phép chạy cả khi WiFi không có (4G mode dùng TinyGsmClient)
+    bool hasNetwork = (WiFi.status() == WL_CONNECTED) || modem_4g_is_connected();
+    if (!hasNetwork) return;
 
     if (!mqtt.connected()) {
         // Phát hiện vừa mất kết nối
@@ -561,7 +594,12 @@ void mqtt_update() {
         }
     } else {
         _wasMqttConnected = true;
-        mqtt.loop();
+        // Guard mqtt.loop() bằng mutex — tránh race với backfillTask (Core 0)
+        // đang gọi mqtt_publish_data() cùng lúc trên cùng TinyGsmClient
+        if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            mqtt.loop();
+            xSemaphoreGive(s_mqttMutex);
+        }
 
         // Sau khi vừa kết nối: gửi online + config
         if (justConnected) {
@@ -572,11 +610,18 @@ void mqtt_update() {
             JsonDocument statusDoc;
             statusDoc["status"] = "online";
             statusDoc["ts"] = ntp_rtc_get_datetime();
-            statusDoc["wifi_ssid"] = WiFi.SSID();
-            statusDoc["wifi_pass"] = WiFi.psk();
             statusDoc["mqtt_host"] = cfg_broker;
             statusDoc["mqtt_port"] = cfg_port;
             statusDoc["fw_version"] = FW_VERSION;
+            if (WiFi.status() == WL_CONNECTED) {
+                statusDoc["net_mode"] = "wifi";
+                statusDoc["ip"] = WiFi.localIP().toString();
+            } else {
+                statusDoc["net_mode"] = "4g";
+                statusDoc["ip"] = modem_4g_ip();
+                statusDoc["rssi"] = modem_4g_rssi();
+                statusDoc["operator"] = modem_4g_operator();
+            }
 
             // Nếu vừa OTA xong → thêm ota_status done
             if (ota_check_just_updated()) {
@@ -586,12 +631,18 @@ void mqtt_update() {
 
             String statusMsg;
             serializeJson(statusDoc, statusMsg);
-            mqtt.publish(topic_status.c_str(), statusMsg.c_str(), false);
+            if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                mqtt.publish(topic_status.c_str(), statusMsg.c_str(), false);
+                xSemaphoreGive(s_mqttMutex);
+            }
             LOGLN_IF(LOG_MQTT, "[MQTT] Published: online status");
 
             // Publish device config (streaming — không giới hạn bởi buffer)
             String cfgMsg = buildDeviceConfig();
-            mqttPublishLarge(topic_config.c_str(), cfgMsg);
+            if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
+                mqttPublishLarge(topic_config.c_str(), cfgMsg);
+                xSemaphoreGive(s_mqttMutex);
+            }
         }
     }
 }
@@ -605,7 +656,17 @@ bool mqtt_publish_data(const String& json) {
         LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAILED: not connected");
         return false;
     }
-    bool ok = mqtt.publish(topic_data.c_str(), json.c_str(), false);
+    bool ok = false;
+    if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        ok = mqtt.publish(topic_data.c_str(), json.c_str(), false);
+        if (!ok) {
+            // TCP socket chết ở tầng modem — force disconnect trong mutex
+            // để mqtt.loop() (cùng core) không chen vào giữa
+            mqtt.disconnect();
+            LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAIL → forced disconnect để trigger reconnect");
+        }
+        xSemaphoreGive(s_mqttMutex);
+    }
     LOG_IF(LOG_MQTT, "[MQTT] Published data (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
     return ok;
 }

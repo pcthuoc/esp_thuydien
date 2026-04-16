@@ -1,9 +1,19 @@
 #pragma once
 #include <Arduino.h>
+#include <Client.h>
 
 // Khởi tạo MQTT client từ config trên SD (/config/network.json)
 // Trả false nếu thiếu config
 bool mqtt_init();
+
+// Đặt transport client (WiFiClient hoặc TinyGsmClient)
+// Phải gọi trước mqtt_init()
+void mqtt_set_client(Client* client);
+
+// Chuyển transport (WiFi↔4G hoặc ngược lại) trong khi đang chạy.
+// client=nullptr → dùng WiFiClient mặc định.
+// MQTT sẽ tự động reconnect trong mqtt_update().
+void mqtt_switch_transport(Client* client);
 
 // Gọi trong loop() — xử lý reconnect + keep-alive
 void mqtt_update();

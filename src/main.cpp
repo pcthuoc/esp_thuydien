@@ -16,15 +16,26 @@
 #include "data_collector.h"
 #include "ota_update.h"
 #include "error_log.h"
+#include "modem_4g.h"
 
-// --- WiFi reconnect ---
-static bool wifiConfigured = false;    // có config WiFi trên SD
-static bool mqttInited     = false;    // đã gọi mqtt_init() thành công
-static unsigned long lastWifiCheck = 0;
-static const unsigned long WIFI_CHECK_INTERVAL = 10000;  // 10s
+// --- Network mode ---
+static bool mode4G         = false;   // true = dùng 4G, false = dùng WiFi
+static bool wifiConfigured = false;   // có SSID trong config
+static bool modem4gInited  = false;   // modem_4g_init() thành công
+static bool mqttInited     = false;   // mqtt_init() đã được gọi
 
-// --- WiFi STA auto-connect ---
-bool wifi_connect_from_config() {
+// --- Network check timer ---
+static unsigned long lastNetCheck = 0;
+static const unsigned long NET_CHECK_INTERVAL = 15000;  // 15s
+
+// --- 4G time sync ---
+static unsigned long last4gTimeSync = 0;
+static const unsigned long SYNC_4G_OK_INTERVAL   = 3600000UL;
+static const unsigned long SYNC_4G_FAIL_INTERVAL  = 60000UL;
+static bool timeSynced4g = false;
+
+// --- WiFi connect helper ---
+static bool wifi_connect_from_config() {
     String json = sd_read_file("/config/network.json");
     if (json.length() == 0) {
         Serial.println("[WIFI] Không tìm thấy config network");
@@ -108,27 +119,6 @@ void onButtonLongPress() {
     }
 }
 
-void printHelp() {
-    Serial.println("=== Test Commands ===");
-    Serial.println("--- LED ---");
-    Serial.println("  0 - BOOTING (vàng nhấp nháy nhanh)");
-    Serial.println("  1 - WIFI_CONNECTING (xanh dương nhấp nháy)");
-    Serial.println("  2 - MQTT_CONNECTING (xanh dương thở)");
-    Serial.println("  3 - ONLINE_OK (xanh lá sáng)");
-    Serial.println("  4 - ONLINE_SENSOR_WARN (xanh lá nhấp nháy)");
-    Serial.println("  5 - OFFLINE_BUFFERING (cam nhấp nháy)");
-    Serial.println("  6 - ERROR_CRITICAL (đỏ sáng)");
-    Serial.println("  7 - CONFIG_AP_MODE (tím thở)");
-    Serial.println("--- SD Card ---");
-    Serial.println("  s - Kiểm tra SD card");
-    Serial.println("  w - Ghi file test");
-    Serial.println("  r - Đọc file test");
-    Serial.println("  d - Xóa file test");
-    Serial.println("---");
-    Serial.println("  h - Hiển thị menu này");
-    Serial.println("=====================");
-}
-
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -183,41 +173,70 @@ void setup() {
     rain_init();
     Serial.println("[BOOT] Rain gauge OK (DI1=GPIO1)");
 
-    // Auto-connect WiFi từ config đã lưu
-    if (wifi_connect_from_config()) {
-        wifiConfigured = true;
-        Serial.println("[BOOT] WiFi connected!");
-
-        // Sync NTP (nguồn thời gian chính)
-        if (ntp_rtc_sync_ntp()) {
-            Serial.printf("[BOOT] NTP OK: %s\n", ntp_rtc_get_datetime().c_str());
-        }
-
-        // Init MQTT
-        if (mqtt_init()) {
-            mqttInited = true;
-            led_set_state(LedState::MQTT_CONNECTING);
-            Serial.println("[BOOT] MQTT init OK, connecting...");
-        } else {
-            led_set_state(LedState::ONLINE_OK);
-            Serial.println("[BOOT] MQTT chưa cấu hình");
-        }
-    } else {
-        // Kiểm tra xem có config nhưng kết nối thất bại hay hoàn toàn không có config
-        String netJson = sd_read_file("/config/network.json");
-        if (netJson.length() > 0) {
-            JsonDocument tmpDoc;
-            if (!deserializeJson(tmpDoc, netJson)) {
-                const char* ssid = tmpDoc["wifi_ssid"];
-                if (ssid && strlen(ssid) > 0) {
-                    wifiConfigured = true;  // có config → sẽ thử reconnect
-                    Serial.println("[BOOT] WiFi config found, will retry in loop");
-                }
+    // Đọc config mạng
+    String netModeStr = "wifi";
+    String simApn = "", simPin = "";
+    {
+        String nj = sd_read_file("/config/network.json");
+        if (nj.length() > 0) {
+            JsonDocument nd;
+            if (!deserializeJson(nd, nj)) {
+                netModeStr = nd["net_mode"] | "wifi";
+                simApn     = nd["apn"]      | "";
+                simPin     = nd["sim_pin"]  | "";
+                const char* s = nd["wifi_ssid"];
+                if (s && strlen(s) > 0) wifiConfigured = true;
             }
         }
-        led_set_state(LedState::OFFLINE_BUFFERING);
-        Serial.println("[BOOT] WiFi chưa cấu hình hoặc kết nối thất bại");
-        Serial.println("[BOOT] Nhấn giữ nút 3s để vào AP mode cấu hình");
+    }
+    mode4G = (netModeStr == "4g");
+    Serial.printf("[BOOT] Net mode: %s\n", netModeStr.c_str());
+
+    if (mode4G) {
+        // --- 4G only ---
+        led_set_state(LedState::WIFI_CONNECTING);
+        const char* pin4g = (simPin.length() > 0) ? simPin.c_str() : nullptr;
+        if (modem_4g_init(simApn.c_str(), pin4g)) {
+            modem4gInited = true;
+            timeSynced4g = modem_4g_sync_time();
+            if (timeSynced4g) {
+                ntp_rtc_write_rtc();
+                Serial.printf("[BOOT] 4G time OK: %s\n", ntp_rtc_get_datetime().c_str());
+            } else {
+                Serial.println("[BOOT] 4G time sync FAILED — dùng RTC dự phòng");
+            }
+            last4gTimeSync = millis();
+            mqtt_set_client(modem_4g_get_client());
+            if (mqtt_init()) {
+                mqttInited = true;
+                led_set_state(LedState::MQTT_CONNECTING);
+                Serial.println("[BOOT] MQTT init OK (4G)");
+            } else {
+                led_set_state(LedState::ONLINE_OK);
+                Serial.println("[BOOT] MQTT chưa cấu hình");
+            }
+        } else {
+            led_set_state(LedState::OFFLINE_BUFFERING);
+            Serial.println("[BOOT] 4G khởi động thất bại");
+        }
+    } else {
+        // --- WiFi only ---
+        if (wifi_connect_from_config()) {
+            Serial.println("[BOOT] WiFi connected!");
+            ntp_rtc_sync_ntp();
+            if (mqtt_init()) {
+                mqttInited = true;
+                led_set_state(LedState::MQTT_CONNECTING);
+                Serial.println("[BOOT] MQTT init OK (WiFi)");
+            } else {
+                led_set_state(LedState::ONLINE_OK);
+                Serial.println("[BOOT] MQTT chưa cấu hình");
+            }
+        } else {
+            led_set_state(LedState::OFFLINE_BUFFERING);
+            Serial.println("[BOOT] WiFi thất bại — offline mode");
+            Serial.println("[BOOT] Nhấn giữ nút 3s để vào AP mode");
+        }
     }
 
     // Init Modbus RTU
@@ -245,15 +264,14 @@ void setup() {
     mqtt_set_config_callback(data_collector_reload_calc);
 
     // Init Data Collector
-    data_collector_init();
+    data_collector_init(mode4G);
     Serial.println("[BOOT] Data collector OK");
-
-    printHelp();
 }
 
 void loop() {
     led_update();
     button_update();
+    counter_update();
 
     // AP mode → ưu tiên LED + dừng mọi hoạt động đọc dữ liệu và gửi
     if (webserver_is_running()) {
@@ -268,105 +286,62 @@ void loop() {
     // OTA đang chạy → dừng đọc sensor, chỉ giữ MQTT
     if (ota_in_progress()) return;
 
-    ntp_rtc_update();
+    // NTP sync định kỳ (WiFi only)
+    if (!mode4G) ntp_rtc_update();
     rain_update();
     data_collector_update();
 
-    // --- WiFi auto-reconnect ---
-    if (wifiConfigured && !webserver_is_running()) {
-        unsigned long now = millis();
-        if (now - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
-            lastWifiCheck = now;
-            if (WiFi.status() != WL_CONNECTED) {
-                Serial.println("[WIFI] Disconnected! Reconnecting...");
-                err_log("WIFI", "Disconnected — attempting reconnect");
+    if (webserver_is_running()) return;
+
+    unsigned long now = millis();
+    if (now - lastNetCheck >= NET_CHECK_INTERVAL) {
+        lastNetCheck = now;
+
+        if (!mode4G) {
+            // --- WiFi reconnect ---
+            if (WiFi.status() != WL_CONNECTED && wifiConfigured) {
+                Serial.println("[WIFI] Mất kết nối, reconnect...");
+                err_log("WIFI", "Disconnected — reconnecting");
                 led_set_state(LedState::WIFI_CONNECTING);
                 WiFi.reconnect();
-
-                // Đợi tối đa 10s
-                int timeout = 20;
-                while (WiFi.status() != WL_CONNECTED && timeout > 0) {
-                    delay(500);
-                    led_update();
-                    button_update();
-                    timeout--;
-                    if (webserver_is_running()) break;
+                int t = 20;
+                while (WiFi.status() != WL_CONNECTED && t-- > 0) {
+                    delay(500); led_update(); button_update();
                 }
-
                 if (WiFi.status() == WL_CONNECTED) {
-                    Serial.printf("[WIFI] Reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
-                    err_log("WIFI", "Reconnected IP=" + WiFi.localIP().toString());
-
-                    // Init MQTT lần đầu nếu chưa
-                    if (!mqttInited) {
-                        if (mqtt_init()) {
-                            mqttInited = true;
-                            Serial.println("[WIFI] MQTT init OK after reconnect");
-                        }
-                    }
-                    // NTP sync lại
+                    Serial.printf("[WIFI] OK: %s\n", WiFi.localIP().toString().c_str());
+                    err_log("WIFI", "Reconnected");
                     ntp_rtc_sync_ntp();
                     led_set_state(LedState::MQTT_CONNECTING);
                 } else {
-                    Serial.println("[WIFI] Reconnect failed, will retry...");
-                    err_log("WIFI", "Reconnect FAILED");
+                    Serial.println("[WIFI] Reconnect thất bại, thử lại sau...");
                     led_set_state(LedState::OFFLINE_BUFFERING);
                 }
             }
+        } else {
+            // --- 4G reconnect ---
+            if (modem4gInited && !modem_4g_is_connected()) {
+                Serial.println("[4G] Mất kết nối, reconnect...");
+                err_log("4G", "Connection lost — reconnecting");
+                led_set_state(LedState::WIFI_CONNECTING);
+                if (modem_4g_reconnect()) {
+                    Serial.println("[4G] Reconnected!");
+                    timeSynced4g = modem_4g_sync_time();
+                    if (timeSynced4g) ntp_rtc_write_rtc();
+                    last4gTimeSync = millis();
+                    led_set_state(LedState::MQTT_CONNECTING);
+                } else {
+                    led_set_state(LedState::OFFLINE_BUFFERING);
+                }
+            }
+
+            // Periodic 4G time re-sync
+            unsigned long syncInterval = timeSynced4g ? SYNC_4G_OK_INTERVAL : SYNC_4G_FAIL_INTERVAL;
+            if (millis() - last4gTimeSync >= syncInterval) {
+                timeSynced4g = modem_4g_sync_time();
+                if (timeSynced4g) ntp_rtc_write_rtc();
+                last4gTimeSync = millis();
+            }
         }
     }
-
-    // if (Serial.available()) {
-    //     char c = Serial.read();
-    //     switch (c) {
-    //         // LED test
-    //         case '0': led_set_state(LedState::BOOTING);            Serial.println(">> BOOTING");            break;
-    //         case '1': led_set_state(LedState::WIFI_CONNECTING);     Serial.println(">> WIFI_CONNECTING");     break;
-    //         case '2': led_set_state(LedState::MQTT_CONNECTING);     Serial.println(">> MQTT_CONNECTING");     break;
-    //         case '3': led_set_state(LedState::ONLINE_OK);           Serial.println(">> ONLINE_OK");           break;
-    //         case '4': led_set_state(LedState::ONLINE_SENSOR_WARN);  Serial.println(">> ONLINE_SENSOR_WARN");  break;
-    //         case '5': led_set_state(LedState::OFFLINE_BUFFERING);   Serial.println(">> OFFLINE_BUFFERING");   break;
-    //         case '6': led_set_state(LedState::ERROR_CRITICAL);      Serial.println(">> ERROR_CRITICAL");      break;
-    //         case '7': led_set_state(LedState::CONFIG_AP_MODE);      Serial.println(">> CONFIG_AP_MODE");      break;
-
-    //         // SD card test
-    //         case 's': {
-    //             Serial.printf("[SD] Inserted: %s\n", sd_is_inserted() ? "YES" : "NO");
-    //             Serial.printf("[SD] Total: %llu MB\n", sd_total_bytes() / (1024 * 1024));
-    //             Serial.printf("[SD] Used:  %llu MB\n", sd_used_bytes() / (1024 * 1024));
-    //             break;
-    //         }
-    //         case 'w': {
-    //             if (sd_write_file("/test.txt", "Hello from ESP32-S3!\n")) {
-    //                 Serial.println("[SD] Write OK: /test.txt");
-    //             } else {
-    //                 Serial.println("[SD] Write FAILED");
-    //             }
-    //             break;
-    //         }
-    //         case 'r': {
-    //             String content = sd_read_file("/test.txt");
-    //             if (content.length() > 0) {
-    //                 Serial.printf("[SD] Read: %s", content.c_str());
-    //             } else {
-    //                 Serial.println("[SD] Read FAILED or empty");
-    //             }
-    //             break;
-    //         }
-    //         case 'd': {
-    //             if (sd_remove("/test.txt")) {
-    //                 Serial.println("[SD] Deleted /test.txt");
-    //             } else {
-    //                 Serial.println("[SD] Delete FAILED");
-    //             }
-    //             break;
-    //         }
-
-    //         case 'h': case 'H': printHelp(); break;
-    //         default: break;
-    //     }
-    // }
-
-
-
-  }
+}

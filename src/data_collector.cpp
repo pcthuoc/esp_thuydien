@@ -9,6 +9,8 @@
 #include "ntp_rtc.h"
 #include "sd_card.h"
 #include "led_status.h"
+#include "webserver.h"
+#include "error_log.h"
 #include <ArduinoJson.h>
 
 // ============================================================
@@ -61,7 +63,6 @@ static bool debugMode = false;
 
 // FreeRTOS sync primitives
 static EventGroupHandle_t s_mbEvent   = nullptr;
-static SemaphoreHandle_t  s_pubMutex  = nullptr;
 #define MB_BIT_TRIGGER  (1 << 0)   // main → modbusTask: bắt đầu poll
 #define MB_BIT_DONE     (1 << 1)   // modbusTask → main: đã xong
 
@@ -78,7 +79,7 @@ static bool tcpActive     = false;
 static void doAdcPoll();
 static void doModbusPoll();
 static void doPublish();
-static void saveToSd(const String& payload);
+static void saveToSd(const String& payload, const String& ts);
 
 // ============================================================
 // Modbus poll task (Core 0, priority 3)
@@ -118,6 +119,7 @@ static void backfillTask(void* pv) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(BACKFILL_INTERVAL_MS));
 
+        if (webserver_is_running()) continue;  // AP mode — không gửi
         if (!mqtt_is_connected()) continue;
 
         auto dates = sd_list_dir("/backfill");
@@ -141,29 +143,41 @@ static void backfillTask(void* pv) {
                 if (sent >= BACKFILL_FILES_PER_CYCLE) break;
                 if (!mqtt_is_connected()) break;
 
+                // Yield trước mỗi file — cho IDLE0 chạy, tránh WDT
+                vTaskDelay(pdMS_TO_TICKS(20));
+
                 String path = dir + "/" + fname;
                 String payload = sd_read_file(path.c_str());
                 if (payload.length() == 0) { sd_remove(path.c_str()); continue; }
 
-                // Lấy mutex trước khi gửi (doPublish đang giữ mutex thì chờ)
-                if (xSemaphoreTake(s_pubMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                    bool ok = mqtt_publish_data(payload);
-                    xSemaphoreGive(s_pubMutex);
+                // Yield sau SD read (SD block có thể tốn vài ms)
+                vTaskDelay(pdMS_TO_TICKS(10));
 
-                    if (ok) {
-                        sd_remove(path.c_str());
-                        sent++;
-                        LOG_IF(LOG_DATA, "[BACKFILL] Sent %d: %s\n", sent, path.c_str());
-                        if (sent < BACKFILL_FILES_PER_CYCLE)
-                            vTaskDelay(pdMS_TO_TICKS(BACKFILL_FILE_GAP_MS));
-                    } else {
-                        LOGLN_IF(LOG_DATA, "[BACKFILL] Publish FAIL, abort cycle");
-                        goto next_cycle;
-                    }
+                // Lấy mutex MQTT bên trong mqtt_publish_data() — không cần guard ở đây nữa
+                bool ok = mqtt_publish_data(payload);
+
+                // Yield sau mqtt publish — TinyGSM busy-loop serial có thể block CPU vài giây
+                vTaskDelay(pdMS_TO_TICKS(50));
+
+                if (ok) {
+                    sd_remove(path.c_str());
+                    sent++;
+                    LOG_IF(LOG_DATA, "[BACKFILL] Sent %d: %s\n", sent, path.c_str());
+                    if (sent < BACKFILL_FILES_PER_CYCLE)
+                        vTaskDelay(pdMS_TO_TICKS(BACKFILL_FILE_GAP_MS));
+                } else {
+                    LOGLN_IF(LOG_DATA, "[BACKFILL] Publish FAIL, abort cycle");
+                    err_log("BACKFILL", "Publish FAIL: " + path);
+                    // mqtt_publish_data đã force-disconnect, chờ mqtt_update() reconnect
+                    // trước khi backfill thử lại ở chu kỳ tiếp theo
+                    vTaskDelay(pdMS_TO_TICKS(10000));
+                    goto next_cycle;
                 }
             }
 
-            if (sd_list_dir(dir.c_str()).empty()) sd_rmdir(dir.c_str());
+            // Xoá thư mục nếu trống — dùng lại danh sách đã có thay vì scan lại SD
+            if (files.size() == (size_t)sent || sd_list_dir(dir.c_str()).empty())
+                sd_rmdir(dir.c_str());
         }
 
         next_cycle:
@@ -377,7 +391,7 @@ static void doPublish() {
         grp["ts"] = ts;
         for (uint8_t i = 0; i < COUNTER_CHANNELS; i++) {
             char key[4]; snprintf(key, sizeof(key), "E%d", i + 1);
-            uint16_t cnt = counter_get(i);
+            int16_t cnt = counter_get(i);
             float real = calcApply(calcCfg[CALC_ENCODER_OFF + i], (float)cnt);
             JsonObject ch = grp[key].to<JsonObject>();
             ch["raw"] = cnt;
@@ -443,11 +457,8 @@ static void doPublish() {
     // ---- Publish hoặc lưu offline ----
     bool ok = false;
     if (mqtt_is_connected()) {
-        // Lấy mutex — block backfillTask trong khi gửi realtime
-        if (xSemaphoreTake(s_pubMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-            ok = mqtt_publish_data(payload);
-            xSemaphoreGive(s_pubMutex);
-        }
+        // mqtt_publish_data() tự guard bằng s_mqttMutex bên trong mqtt_client
+        ok = mqtt_publish_data(payload);
     }
 
     if (ok) {
@@ -456,12 +467,13 @@ static void doPublish() {
     } else {
         led_flash(255, 0, 0, 2);   // Đỏ chớp 2 lần
         LOGLN_IF(LOG_DATA, "[DATA] Publish FAIL → save SD");
+        err_log("MQTT", "Publish FAIL ts=" + ts);
 
         // Đổi ingest_type sang backfill rồi lưu
         doc["ingest_type"] = "backfill";
         String backfill;
         serializeJson(doc, backfill);
-        saveToSd(backfill);
+        saveToSd(backfill, ts);
     }
 
     resetAccumulators();
@@ -471,22 +483,24 @@ static void doPublish() {
 // Lưu offline buffer vào SD
 // ============================================================
 
-static void saveToSd(const String& payload) {
-    String dt = ntp_rtc_get_datetime();
-    if (dt.length() < 19) {
-        LOGLN_IF(LOG_DATA, "[DATA] SD save skip: invalid time");
+static void saveToSd(const String& payload, const String& ts) {
+    // Dùng chính ts đã ghi trong payload để đặt tên file
+    // → đảm bảo filename và JSON ts luôn khớp, tránh ts nhảy khi backfill
+    if (ts.length() < 19 || ts.startsWith("1970")) {
+        LOGLN_IF(LOG_DATA, "[DATA] SD save skip: clock not synced");
         return;
     }
 
-    // "2026-04-07T14:35:00+07:00"
-    String datePart = dt.substring(0, 10);
+    // ts format: "2026-04-07T14:35:00+07:00"
+    String datePart = ts.substring(0, 10);
     String path = "/backfill/" + datePart + "/"
-                + dt.substring(11, 13) + dt.substring(14, 16) + dt.substring(17, 19) + ".json";
+                + ts.substring(11, 13) + ts.substring(14, 16) + ts.substring(17, 19) + ".json";
 
     if (sd_write_file(path.c_str(), payload.c_str())) {
         LOG_IF(LOG_DATA, "[DATA] Saved: %s (%d bytes)\n", path.c_str(), payload.length());
     } else {
         LOG_IF(LOG_DATA, "[DATA] SD save FAILED: %s\n", path.c_str());
+        err_log("SD", "Save FAILED: " + path);
     }
 }
 
@@ -494,11 +508,11 @@ static void saveToSd(const String& payload) {
 // Public API
 // ============================================================
 
-void data_collector_init() {
+void data_collector_init(bool use4G) {
     // Xác định module nào active
     analogActive  = analog_ads1_ok() || analog_ads2_ok();
-    encoderActive = true;   // PCNT luôn init
-    diActive      = true;   // Rain gauge luôn init
+    encoderActive = true;   // EN1 quadrature (IO1=A, IO2=B)
+    diActive      = true;   // Rain gauge (IO40)
     rtuActive     = modbus_rtu_channel_count() > 0;
     tcpActive     = modbus_tcp_channel_count() > 0;
 
@@ -513,14 +527,20 @@ void data_collector_init() {
 
     // Tạo FreeRTOS primitives
     s_mbEvent  = xEventGroupCreate();
-    s_pubMutex = xSemaphoreCreateMutex();
 
     // Modbus poll task — Core 0, priority 3
     // (càng cao hơn loop() để xử lý nhanh khi được trigger)
     xTaskCreatePinnedToCore(modbusTask, "mb_poll", 8192, nullptr, 3, nullptr, 0);
 
-    // Backfill task — bất kỳ core, priority 1
-    xTaskCreate(backfillTask, "backfill", 8192, nullptr, 1, nullptr);
+    // Backfill task
+    // 4G: pin Core 1 (cùng core với loop()/mqtt_update()) → loại bỏ race condition
+    //     TinyGsmClient UART giữa 2 core (nguyên nhân "lid invalid" → mất 4G)
+    // WiFi: chạy bất kỳ core — WiFiClient/lwIP đã thread-safe, không cần giới hạn
+    if (use4G) {
+        xTaskCreatePinnedToCore(backfillTask, "backfill", 8192, nullptr, 1, nullptr, 1);
+    } else {
+        xTaskCreate(backfillTask, "backfill", 8192, nullptr, 1, nullptr);
+    }
 
     // Trigger lần đầu ngay sau init
     xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);

@@ -1,4 +1,5 @@
 #include "ntp_rtc.h"
+#include "debug_config.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <time.h>
@@ -142,12 +143,12 @@ bool ntp_rtc_init() {
 }
 
 bool ntp_rtc_sync_ntp() {
+    lastSyncAttempt = millis();
+
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[NTP] No WiFi, skip");
         return false;
     }
-
-    lastSyncAttempt = millis();
     Serial.println("[NTP] Đang sync...");
 
     configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER1, NTP_SERVER2);
@@ -218,4 +219,28 @@ bool ntp_rtc_is_valid() {
     time(&now);
     struct tm* t = localtime(&now);
     return t->tm_year > 124;  // > 2024
+}
+
+bool ntp_rtc_write_rtc() {
+    LOGLN_IF(LOG_NTP, "[RTC-WRITE] Ghi system clock vào DS3231...");
+
+    if (!rtcFound) {
+        LOGLN_IF(LOG_NTP, "[RTC-WRITE] DS3231 không tìm thấy — bỏ qua");
+        return false;
+    }
+
+    time_t now;
+    time(&now);
+    LOG_IF(LOG_NTP, "[RTC-WRITE] epoch hiện tại: %ld\n", (long)now);
+
+    struct tm utcTm;
+    gmtime_r(&now, &utcTm);
+
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &utcTm);
+    LOG_IF(LOG_NTP, "[RTC-WRITE] UTC cần ghi: %s\n", buf);
+
+    bool ok = ds3231_write(&utcTm);
+    LOG_IF(LOG_NTP, "[RTC-WRITE] ds3231_write() = %s\n", ok ? "OK" : "FAILED");
+    return ok;
 }

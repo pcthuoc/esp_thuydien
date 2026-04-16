@@ -24,4 +24,7 @@ String ntp_rtc_get_datetime();
 // Thời gian hợp lệ? (năm > 2024)
 bool ntp_rtc_is_valid();
 
+// Ghi UTC hiện tại của system clock vào DS3231 (dùng sau khi sync 4G)
+bool ntp_rtc_write_rtc();
+
 #endif

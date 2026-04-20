@@ -105,84 +105,93 @@ static void modbusTask(void* pv) {
 }
 
 // ============================================================
-// Backfill drain task (FreeRTOS, priority 1)
-// — Chạy mỗi 15s, gửi tối đa 3 file/chu kỳ (12 file/phút)
-// — Dùng pubMutex tránh race condition với doPublish()
+// Backfill drain — chạy inline trong data_collector_update()
+// Không dùng FreeRTOS task → hoàn toàn single-threaded với mqtt_update()
+// → không có race condition TinyGsmClient UART, không cần mutex
+// — Gửi tối đa 1 file/chu kỳ, gọi mỗi BACKFILL_INTERVAL_MS
 // ============================================================
-#define BACKFILL_INTERVAL_MS      15000
-#define BACKFILL_FILES_PER_CYCLE  3
-#define BACKFILL_FILE_GAP_MS      500
+#define BACKFILL_INTERVAL_MS   15000
+#define BACKFILL_MAX_DATE_DIRS 3    // Giữ tối đa 3 ngày backfill (~4320 files)
+                                    // Nếu offline lâu hơn → xóa ngày cũ nhất để tránh
+                                    // sd_list_dir() chậm và SD đầy
 
-static void backfillTask(void* pv) {
-    vTaskDelay(pdMS_TO_TICKS(30000));  // Chờ boot ổn định
+static unsigned long lastBackfillMs = 0;
 
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(BACKFILL_INTERVAL_MS));
+// Stuck-file guard: xóa file backfill nếu fail liên tiếp ≥ 3 lần
+// Nguyên nhân: TinyGsmClient AT glitch, WiFiClient drop ngay sau connected() check,
+// hay bất kỳ trạng thái nào khiến mqtt_publish_data() fail mãi dù mqtt_is_connected() = true
+static String   s_bfFailPath;
+static uint8_t  s_bfFailCount = 0;
 
-        if (webserver_is_running()) continue;  // AP mode — không gửi
-        if (!mqtt_is_connected()) continue;
+// Xóa thư mục backfill cũ nhất nếu có quá nhiều ngày
+static void pruneBackfillDirs() {
+    auto dates = sd_list_dir("/backfill");
+    while ((int)dates.size() > BACKFILL_MAX_DATE_DIRS) {
+        // dates đã sắp xếp tăng dần → dates[0] là cũ nhất
+        String oldest = "/backfill/" + dates[0];
+        auto files = sd_list_dir(oldest.c_str());
+        for (const String& f : files) {
+            sd_remove((oldest + "/" + f).c_str());
+        }
+        sd_rmdir(oldest.c_str());
+        Serial.printf("[BACKFILL] Pruned oldest dir: %s (%d files)\n",
+                      oldest.c_str(), (int)files.size());
+        dates.erase(dates.begin());
+    }
+}
 
-        auto dates = sd_list_dir("/backfill");
-        if (dates.empty()) continue;
+static void doBackfillCycle() {
+    if (webserver_is_running()) return;
+    if (!mqtt_is_connected()) return;
 
-        int sent = 0;
+    auto dates = sd_list_dir("/backfill");
+    if (dates.empty()) return;
 
-        for (const String& date : dates) {
-            if (sent >= BACKFILL_FILES_PER_CYCLE) break;
-            if (!mqtt_is_connected()) break;
+    for (const String& date : dates) {
+        String dir = "/backfill/" + date;
+        auto files = sd_list_dir(dir.c_str());
 
-            String dir = "/backfill/" + date;
-            auto files = sd_list_dir(dir.c_str());
-
-            if (files.empty()) {
-                sd_rmdir(dir.c_str());
-                continue;
-            }
-
-            for (const String& fname : files) {
-                if (sent >= BACKFILL_FILES_PER_CYCLE) break;
-                if (!mqtt_is_connected()) break;
-
-                // Yield trước mỗi file — cho IDLE0 chạy, tránh WDT
-                vTaskDelay(pdMS_TO_TICKS(20));
-
-                String path = dir + "/" + fname;
-                String payload = sd_read_file(path.c_str());
-                if (payload.length() == 0) { sd_remove(path.c_str()); continue; }
-
-                // Yield sau SD read (SD block có thể tốn vài ms)
-                vTaskDelay(pdMS_TO_TICKS(10));
-
-                // Lấy mutex MQTT bên trong mqtt_publish_data() — không cần guard ở đây nữa
-                bool ok = mqtt_publish_data(payload);
-
-                // Yield sau mqtt publish — TinyGSM busy-loop serial có thể block CPU vài giây
-                vTaskDelay(pdMS_TO_TICKS(50));
-
-                if (ok) {
-                    sd_remove(path.c_str());
-                    sent++;
-                    LOG_IF(LOG_DATA, "[BACKFILL] Sent %d: %s\n", sent, path.c_str());
-                    if (sent < BACKFILL_FILES_PER_CYCLE)
-                        vTaskDelay(pdMS_TO_TICKS(BACKFILL_FILE_GAP_MS));
-                } else {
-                    LOGLN_IF(LOG_DATA, "[BACKFILL] Publish FAIL, abort cycle");
-                    err_log("BACKFILL", "Publish FAIL: " + path);
-                    // mqtt_publish_data đã force-disconnect, chờ mqtt_update() reconnect
-                    // trước khi backfill thử lại ở chu kỳ tiếp theo
-                    vTaskDelay(pdMS_TO_TICKS(10000));
-                    goto next_cycle;
-                }
-            }
-
-            // Xoá thư mục nếu trống — dùng lại danh sách đã có thay vì scan lại SD
-            if (files.size() == (size_t)sent || sd_list_dir(dir.c_str()).empty())
-                sd_rmdir(dir.c_str());
+        if (files.empty()) {
+            sd_rmdir(dir.c_str());
+            continue;
         }
 
-        next_cycle:
-        if (sent > 0)
-            LOG_IF(LOG_DATA, "[BACKFILL] Cycle done: %d file(s) sent\n", sent);
+        for (const String& fname : files) {
+            if (!mqtt_is_connected()) return;
+
+            String path = dir + "/" + fname;
+            String payload = sd_read_file(path.c_str());
+            if (payload.length() == 0) { sd_remove(path.c_str()); continue; }
+
+            bool ok = mqtt_publish_data(payload);
+            if (ok) {
+                sd_remove(path.c_str());
+                s_bfFailPath  = "";
+                s_bfFailCount = 0;
+                LOG_IF(LOG_DATA, "[BACKFILL] Sent: %s\n", path.c_str());
+                if (sd_list_dir(dir.c_str()).empty()) sd_rmdir(dir.c_str());
+            } else {
+                LOGLN_IF(LOG_DATA, "[BACKFILL] Publish FAIL, abort");
+                err_log("BACKFILL", "Publish FAIL: " + path);
+                // Stuck-file guard: cùng path fail ≥ 3 lần liên tiếp → xóa tránh block mãi
+                // WiFi: TCP drop sau connected() check | 4G: AT glitch modem buffer
+                if (path == s_bfFailPath) {
+                    if (++s_bfFailCount >= 3) {
+                        Serial.printf("[BACKFILL] Skip stuck file (%d fails): %s\n",
+                                      s_bfFailCount, path.c_str());
+                        err_log("BACKFILL", "Skip stuck: " + path);
+                        sd_remove(path.c_str());
+                        s_bfFailPath  = "";
+                        s_bfFailCount = 0;
+                    }
+                } else {
+                    s_bfFailPath  = path;
+                    s_bfFailCount = 1;
+                }
+            }
+            // Gửi 1 file/chu kỳ, trả quyền về loop() để mqtt_update() chạy
+            return;
+        }
     }
 }
 
@@ -491,6 +500,9 @@ static void saveToSd(const String& payload, const String& ts) {
         return;
     }
 
+    // Giới hạn số ngày backfill trước khi lưu thêm
+    pruneBackfillDirs();
+
     // ts format: "2026-04-07T14:35:00+07:00"
     String datePart = ts.substring(0, 10);
     String path = "/backfill/" + datePart + "/"
@@ -522,25 +534,18 @@ void data_collector_init(bool use4G) {
     loadCalcConfigs();
     resetAccumulators();
 
-    lastAdcPollMs = millis();
-    lastPublishMs = millis();
+    lastAdcPollMs  = millis();
+    lastPublishMs  = millis();
+    lastBackfillMs = millis();  // realtimeImminent guard bảo vệ slot realtime đầu tiên
+                               // (millis() + PUBLISH_INTERVAL_MS bị unsigned wrap → fire ngay anyway)
 
     // Tạo FreeRTOS primitives
     s_mbEvent  = xEventGroupCreate();
 
     // Modbus poll task — Core 0, priority 3
-    // (càng cao hơn loop() để xử lý nhanh khi được trigger)
     xTaskCreatePinnedToCore(modbusTask, "mb_poll", 8192, nullptr, 3, nullptr, 0);
 
-    // Backfill task
-    // 4G: pin Core 1 (cùng core với loop()/mqtt_update()) → loại bỏ race condition
-    //     TinyGsmClient UART giữa 2 core (nguyên nhân "lid invalid" → mất 4G)
-    // WiFi: chạy bất kỳ core — WiFiClient/lwIP đã thread-safe, không cần giới hạn
-    if (use4G) {
-        xTaskCreatePinnedToCore(backfillTask, "backfill", 8192, nullptr, 1, nullptr, 1);
-    } else {
-        xTaskCreate(backfillTask, "backfill", 8192, nullptr, 1, nullptr);
-    }
+    // Backfill chạy inline trong data_collector_update() — không cần task riêng
 
     // Trigger lần đầu ngay sau init
     xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);
@@ -582,9 +587,31 @@ void data_collector_update() {
         }
 
         doPublish();
+        lastBackfillMs = now;  // reset backfill timer: không chạy backfill ngay sau realtime
 
         // Trigger chu kỳ Modbus mới ngay sau khi publish
         xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);
+    }
+
+    // Backfill: chỉ chạy khi "rảnh" — không tranh với cửa sổ realtime sắp đến
+    // Điều kiện: (1) đã qua BACKFILL_INTERVAL_MS từ lần gửi cuối
+    //            (2) realtime tiếp theo còn > BACKFILL_INTERVAL_MS nữa
+    //
+    // WiFi:  mqtt_publish_data() block ~2–20ms  → guard 15s cực kỳ conservative, OK
+    // 4G:    mqtt_publish_data() block 150–700ms (AT+CIPSEND over UART) → guard 15s đủ
+    //        Trường hợp tệ nhất: backfill lúc t=44.3s (700ms) → xong t=45s < t=60s realtime ✓
+    //
+    // FIX BUG SPIN: lastBackfillMs phải reset TRƯỚC khi check realtimeImminent
+    // Trước: nếu imminent=true → không reset → loop() re-enter check mỗi ~1ms → spin 15s
+    // Sau:   reset trước → nếu imminent=true → lần sau check sau 15s nữa, không spin
+    if (now - lastBackfillMs >= BACKFILL_INTERVAL_MS) {
+        lastBackfillMs = now;  // luôn reset — tránh spin khi realtimeImminent = true
+        unsigned long elapsed = now - lastPublishMs;
+        bool realtimeImminent = (elapsed < PUBLISH_INTERVAL_MS) &&
+                                ((PUBLISH_INTERVAL_MS - elapsed) <= BACKFILL_INTERVAL_MS);
+        if (!realtimeImminent) {
+            doBackfillCycle();
+        }
     }
 }
 

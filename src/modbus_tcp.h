@@ -5,7 +5,7 @@
 #define TCP_MAX_CHANNELS  20  // Tối đa 20 kênh TCP (5 slave × 4 biến)
 
 struct TcpChannel {
-    char name[8];       // "V1", "V2"...
+    char name[16];      // "V1", "V2"...
     char host[16];      // IP address "192.168.1.x"
     uint16_t port;      // Modbus TCP port (502)
     uint8_t slave_id;

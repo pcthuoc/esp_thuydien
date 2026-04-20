@@ -15,9 +15,6 @@
 
 // ETH_RST không nối — W5500 dùng internal power-on reset
 
-// DHCP timeout ngắn để không block boot lâu
-#define ETH_DHCP_TIMEOUT_MS   5000   // 5s thử DHCP
-
 // Timeout khi đọc Modbus TCP (ms)
 #define TCP_CONNECT_TIMEOUT  1000
 #define TCP_READ_TIMEOUT     1000
@@ -103,6 +100,7 @@ static bool readBytes(EthernetClient& client, uint8_t* buf, size_t n) {
     while (got < n) {
         if (millis() - start > (uint32_t)TCP_READ_TIMEOUT) return false;
         if (client.available()) buf[got++] = client.read();
+        else taskYIELD();  // nhường CPU khi chưa có data — cho btn_task chạy đúng 10ms tick
     }
     return true;
 }
@@ -213,38 +211,34 @@ bool w5500_init() {
 
     Ethernet.init(ETH_CS);
 
-    // DHCP với timeout ngắn, truyền SPI instance — chip được detect trong begin()
-    Serial.println("[W5500] DHCP...");
-    if (Ethernet.begin(mac, &ethSPI, ETH_DHCP_TIMEOUT_MS) == 0) {
-        Serial.println("[W5500] DHCP failed, dùng static IP");
+    // W5500 nối vào mạng LAN Modbus công nghiệp — không có DHCP server
+    // Dùng static IP luôn, không thử DHCP (tránh block boot + tránh xóa DNS lwIP)
+    IPAddress ip(192, 168, 0, 200);
+    IPAddress gw(192, 168, 0, 1);
+    IPAddress sn(255, 255, 255, 0);
 
-        // Đọc static IP từ /config/network.json (SD đã init trước w5500_init)
-        // Mặc định nếu không có config
-        IPAddress ip(192, 168, 0, 200);
-        IPAddress gw(192, 168, 0, 1);
-        IPAddress sn(255, 255, 255, 0);
-
-        String json = sd_read_file("/config/network.json");
-        if (json.length() > 0) {
-            JsonDocument doc;
-            if (!deserializeJson(doc, json)) {
-                const char* sip = doc["eth_static_ip"] | (const char*)nullptr;
-                const char* sgw = doc["eth_gateway"]   | (const char*)nullptr;
-                const char* ssn = doc["eth_subnet"]    | (const char*)nullptr;
-                IPAddress tmp;
-                if (sip && tmp.fromString(sip)) { ip = tmp; Serial.printf("[W5500] eth_static_ip = %s\n", sip); }
-                if (sgw && tmp.fromString(sgw)) gw = tmp;
-                if (ssn && tmp.fromString(ssn)) sn = tmp;
-            }
+    String json = sd_read_file("/config/network.json");
+    if (json.length() > 0) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, json)) {
+            const char* sip = doc["eth_static_ip"] | (const char*)nullptr;
+            const char* sgw = doc["eth_gateway"]   | (const char*)nullptr;
+            const char* ssn = doc["eth_subnet"]    | (const char*)nullptr;
+            IPAddress tmp;
+            if (sip && tmp.fromString(sip)) { ip = tmp; Serial.printf("[W5500] eth_static_ip = %s\n", sip); }
+            if (sgw && tmp.fromString(sgw)) gw = tmp;
+            if (ssn && tmp.fromString(ssn)) sn = tmp;
         }
-
-        Ethernet.begin(mac, ip, gw, gw, sn);    // pCUR_SPI đã lưu từ lần begin() trước
-        Serial.printf("[W5500] Static IP: %s\n", Ethernet.localIP().toString().c_str());
-    } else {
-        Serial.printf("[W5500] DHCP OK: %s\n", Ethernet.localIP().toString().c_str());
     }
 
-    // Kiểm tra chip SAU khi begin() — library mới detect được
+    // begin() với SPI + timeout=0: đăng ký &ethSPI vào library, không chờ DHCP
+    Ethernet.begin(mac, &ethSPI, 0);
+    // Set static IP — DNS arg dùng 8.8.8.8 (lwIP DNS dùng chung với WiFi)
+    // Không truyền gw làm DNS — 192.168.0.1 trên mạng LAN không reach được qua WiFi
+    Ethernet.begin(mac, ip, IPAddress(8,8,8,8), gw, sn);
+    Serial.printf("[W5500] Static IP: %s\n", Ethernet.localIP().toString().c_str());
+
+    // Kiểm tra chip SAU khi begin()
     if (Ethernet.hardwareStatus() == EthernetNoHardware) {
         Serial.println("[W5500] NOT found — kiểm tra SPI pins / nguồn");
         return false;
@@ -341,7 +335,7 @@ void modbus_tcp_poll() {
         return;
     }
 
-    Ethernet.maintain();  // DHCP renew nếu cần
+    Ethernet.maintain();  // no-op ở static IP mode, giữ lại để tương thích
 
     EthernetClient client;
     client.setConnectionTimeout(TCP_CONNECT_TIMEOUT);

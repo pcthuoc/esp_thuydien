@@ -30,8 +30,12 @@ bool mqtt_publish_status(const String& json);
 // Publish config lên topic station/{device_id}/config
 bool mqtt_publish_config(const String& json);
 
-// Set callback khi server gửi config mới (để reload calc config)
-void mqtt_set_config_callback(void (*cb)());
+// Set callback khi server gửi config mới (module-aware)
+// module: "rs485", "tcp", "analog", "encoder", "di", "network", "system"
+void mqtt_set_config_callback(void (*cb)(const char* module));
+
+// [DEPRECATED] callback không có tham số — giữ lại để tương thích
+void mqtt_set_config_callback_simple(void (*cb)());
 
 // Gọi mqtt.loop() để giữ kết nối (dùng trong OTA)
 void mqtt_keep_alive();

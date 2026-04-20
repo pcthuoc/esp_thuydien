@@ -2,8 +2,6 @@
 #include <Arduino.h>
 
 // Init: load calc config từ SD, reset accumulators
-// use4G: true = backfillTask pin Core 1 (tránh race TinyGsmClient UART)
-//        false = WiFi, backfillTask chạy bất kỳ core (không có race UART)
 void data_collector_init(bool use4G = false);
 
 // Gọi trong loop() — poll sensor + publish theo chu kỳ

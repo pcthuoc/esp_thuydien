@@ -12,12 +12,15 @@
 #define SD_DET_PIN   21   // Card detect (LOW = có thẻ)
 
 bool sd_init();
+bool sd_reinit();           // Unmount + re-init (gọi khi SD driver bị lỗi)
 bool sd_is_inserted();
 bool sd_write_file(const char* path, const char* content);
 bool sd_append_file(const char* path, const char* content);
 String sd_read_file(const char* path);
 bool sd_exists(const char* path);
 bool sd_remove(const char* path);
+bool sd_rename(const char* from, const char* to);  // Đổi tên/di chuyển file
+long sd_file_size(const char* path);               // Lấy size file không đọc content
 bool sd_mkdir(const char* path);
 uint64_t sd_total_bytes();
 uint64_t sd_used_bytes();

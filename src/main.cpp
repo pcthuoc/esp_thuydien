@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <lwip/dns.h>
 #include <ArduinoJson.h>
 #include "version.h"
 #include "led_status.h"
@@ -23,6 +24,9 @@ static bool mode4G         = false;   // true = dùng 4G, false = dùng WiFi
 static bool wifiConfigured = false;   // có SSID trong config
 static bool modem4gInited  = false;   // modem_4g_init() thành công
 static bool mqttInited     = false;   // mqtt_init() đã được gọi
+
+// --- AP mode request flag (set từ btn_task Core 0, xử lý ở loop() Core 1) ---
+static volatile bool s_apModeRequest = false;
 
 // --- Network check timer ---
 static unsigned long lastNetCheck = 0;
@@ -66,11 +70,10 @@ static bool wifi_connect_from_config() {
         delay(500);
         Serial.print(".");
         led_update();
-        button_update();
         timeout--;
-        // Nếu user bấm giữ nút → vào AP mode, dừng kết nối WiFi
-        if (webserver_is_running()) {
-            Serial.println("\n[WIFI] AP mode activated, abort WiFi connect");
+        // Nếu user bấm giữ nút → vào AP mode, dừng kết nối WiFi ngay
+        if (s_apModeRequest || webserver_is_running()) {
+            Serial.println("\n[WIFI] AP mode requested, abort WiFi connect");
             WiFi.disconnect();
             return false;
         }
@@ -88,35 +91,37 @@ static bool wifi_connect_from_config() {
     }
 }
 
+// --- Config saved callback (từ web AP mode) ---
+static void onWebConfigSaved(const char* module) {
+    Serial.printf("[WEB] Config saved: %s → reload...\n", module);
+    if (strcmp(module, "rs485") == 0) {
+        modbus_rtu_init();
+        Serial.println("[WEB] Modbus RTU reloaded");
+    } else if (strcmp(module, "tcp") == 0) {
+        modbus_tcp_init();
+        Serial.println("[WEB] Modbus TCP reloaded");
+    } else if (strcmp(module, "analog") == 0) {
+        analog_init();
+        Serial.println("[WEB] Analog reloaded");
+    } else if (strcmp(module, "encoder") == 0 || strcmp(module, "di") == 0) {
+        // counter/rain không có reload API, cần restart
+        Serial.printf("[WEB] %s: cần restart để áp dụng\n", module);
+    }
+    // data_collector reload calc (áp dụng cho mọi module)
+    data_collector_reload_calc();
+}
+
 // --- Button callbacks ---
 void onButtonClick() {
     Serial.println("[BTN] Click!");
 }
 
+// Callback này chạy trên Core 0 (btn_task, stack 2048 bytes)
+// CHỈ set flag + abort modem — KHÔNG làm gì nặng (SD, JSON, WiFi, webserver)
 void onButtonLongPress() {
-    Serial.println("[BTN] Long press (3s) -> AP MODE!");
-    if (!webserver_is_running()) {
-        // Đọc AP config từ SD
-        String ap_ssid = "THUYDIEN_CFG";
-        String ap_pass = "12345678";
-
-        String json = sd_read_file("/config/system.json");
-        if (json.length() > 0) {
-            JsonDocument doc;
-            if (!deserializeJson(doc, json)) {
-                if (doc["ap_ssid"].is<const char*>() && strlen(doc["ap_ssid"]) > 0)
-                    ap_ssid = doc["ap_ssid"].as<String>();
-                if (doc["ap_pass"].is<const char*>() && strlen(doc["ap_pass"]) >= 8)
-                    ap_pass = doc["ap_pass"].as<String>();
-            }
-        }
-
-        Serial.printf("[AP] SSID: %s\n", ap_ssid.c_str());
-        led_set_state(LedState::CONFIG_AP_MODE);
-        webserver_init(ap_ssid.c_str(), ap_pass.c_str());
-    } else {
-        Serial.println("[BTN] Web server already running");
-    }
+    Serial.println("[BTN] Long press (3s) -> AP MODE requested");
+    modem_4g_abort();       // an toàn: chỉ set volatile bool
+    s_apModeRequest = true; // loop() sẽ xử lý trên Core 1
 }
 
 void setup() {
@@ -147,6 +152,25 @@ void setup() {
     button_on_click(onButtonClick);
     button_on_long_press(onButtonLongPress);
     Serial.println("[BOOT] Button OK (IO45)");
+
+    // Chạy button_update() trên Core 0 độc lập — hoạt động ngay cả khi Core 1 đang block
+    // trong modem_4g_init() (s_modem.restart() có thể block 10-30s)
+    // Priority 4 > modbusTask(3): tránh starvation khi modbusTask busy-wait UART/TCP
+    xTaskCreatePinnedToCore(
+        [](void*) {
+            for (;;) {
+                button_update();
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+        },
+        "btn_task", 2048, nullptr, 4, nullptr, 0  // Core 0, prio 4 > modbusTask(3)
+    );
+
+    // Đăng ký tick callback cho modem 4G — chỉ cần led_update()
+    // (button_update() đã có task riêng)
+    modem_4g_set_tick_cb([]() {
+        led_update();
+    });
 
     // Init I2C bus (dùng chung cho RTC + ADS1115)
     i2c_init();
@@ -196,7 +220,7 @@ void setup() {
         // --- 4G only ---
         led_set_state(LedState::WIFI_CONNECTING);
         const char* pin4g = (simPin.length() > 0) ? simPin.c_str() : nullptr;
-        if (modem_4g_init(simApn.c_str(), pin4g)) {
+        if (!s_apModeRequest && modem_4g_init(simApn.c_str(), pin4g)) {
             modem4gInited = true;
             timeSynced4g = modem_4g_sync_time();
             if (timeSynced4g) {
@@ -252,6 +276,14 @@ void setup() {
     } else {
         Serial.println("[BOOT] W5500 not found");
     }
+    // Ethernet_Generic dùng chung lwIP với WiFi → begin() có thể ghi đè DNS
+    // Restore lại DNS sau w5500_init() để MQTT resolve được hostname
+    {
+        ip_addr_t dns1 = IPADDR4_INIT_BYTES(8, 8, 8, 8);
+        ip_addr_t dns2 = IPADDR4_INIT_BYTES(1, 1, 1, 1);
+        dns_setserver(0, &dns1);
+        dns_setserver(1, &dns2);
+    }
 
     // Load Modbus TCP channels từ SD (cần W5500 đã init trước)
     if (modbus_tcp_init()) {
@@ -260,8 +292,9 @@ void setup() {
         Serial.println("[BOOT] Modbus TCP: no config");
     }
 
-    // MQTT config callback → data_collector reload
-    mqtt_set_config_callback(data_collector_reload_calc);
+    // MQTT config callback → reload modbus + data_collector
+    mqtt_set_config_callback(onWebConfigSaved);
+    mqtt_set_config_callback_simple(data_collector_reload_calc);
 
     // Init Data Collector
     data_collector_init(mode4G);
@@ -270,8 +303,33 @@ void setup() {
 
 void loop() {
     led_update();
-    button_update();
+    // button_update() chỉ chạy trên Core 0 qua btn_task — KHÔNG gọi ở đây
     counter_update();
+
+    // Xử lý AP mode request (set từ btn_task Core 0, thực hiện ở Core 1 với stack đầy đủ)
+    if (s_apModeRequest) {
+        s_apModeRequest = false;
+        if (!webserver_is_running()) {
+            String ap_ssid = "THUYDIEN_CFG";
+            String ap_pass = "12345678";
+            String json = sd_read_file("/config/system.json");
+            if (json.length() > 0) {
+                JsonDocument doc;
+                if (!deserializeJson(doc, json)) {
+                    if (doc["ap_ssid"].is<const char*>() && strlen(doc["ap_ssid"]) > 0)
+                        ap_ssid = doc["ap_ssid"].as<String>();
+                    if (doc["ap_pass"].is<const char*>() && strlen(doc["ap_pass"]) >= 8)
+                        ap_pass = doc["ap_pass"].as<String>();
+                }
+            }
+            Serial.printf("[AP] SSID: %s\n", ap_ssid.c_str());
+            led_set_state(LedState::CONFIG_AP_MODE);
+            webserver_init(ap_ssid.c_str(), ap_pass.c_str());
+            webserver_set_config_saved_callback(onWebConfigSaved);
+        } else {
+            Serial.println("[BTN] Web server already running");
+        }
+    }
 
     // AP mode → ưu tiên LED + dừng mọi hoạt động đọc dữ liệu và gửi
     if (webserver_is_running()) {
@@ -306,12 +364,21 @@ void loop() {
                 WiFi.reconnect();
                 int t = 20;
                 while (WiFi.status() != WL_CONNECTED && t-- > 0) {
-                    delay(500); led_update(); button_update();
+                    delay(500); led_update();
+                    // Thoát ngay nếu user bấm nút AP mode trong khi đang tự reconnect WiFi
+                    if (s_apModeRequest) { WiFi.disconnect(false, false); break; }
                 }
                 if (WiFi.status() == WL_CONNECTED) {
-                    Serial.printf("[WIFI] OK: %s\n", WiFi.localIP().toString().c_str());
+                    // WiFi.reconnect() không refresh DNS từ DHCP → set thủ công qua lwIP
+                    ip_addr_t dns1 = IPADDR4_INIT_BYTES(8, 8, 8, 8);
+                    ip_addr_t dns2 = IPADDR4_INIT_BYTES(1, 1, 1, 1);
+                    dns_setserver(0, &dns1);
+                    dns_setserver(1, &dns2);
+                    Serial.printf("[WIFI] OK: %s  DNS: 8.8.8.8\n", WiFi.localIP().toString().c_str());
                     err_log("WIFI", "Reconnected");
-                    ntp_rtc_sync_ntp();
+                    // KHÔNG gọi ntp_rtc_sync_ntp() trực tiếp ở đây — sẽ block 5s trong loop()
+                    // ntp_rtc_update() trong loop() sẽ tự sync sau SYNC_FAIL_INTERVAL (60s)
+                    ntp_rtc_force_resync();  // Reset timer để sync sớm, không block ngay
                     led_set_state(LedState::MQTT_CONNECTING);
                 } else {
                     Serial.println("[WIFI] Reconnect thất bại, thử lại sau...");

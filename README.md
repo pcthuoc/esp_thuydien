@@ -250,6 +250,81 @@ C:\Users\HOME\.platformio\packages\tool-esptoolpy\esptool.py ^
 | Modbus poll task (Core 0, EventGroup) | ✅ Hoàn thành |
 | MQTT publish mutex (thread-safe) | ✅ Hoàn thành |
 
+---
+
+## 9. Changelog
+
+### [2026-04-19] — Phân tích & fix backfill: spin bug, stuck-file, init wrap
+
+#### Phân tích timing WiFi vs 4G
+
+Mỗi lần `mqtt_publish_data()` gọi transport layer sẽ block Core 1 khác nhau tuỳ transport:
+
+| Transport | Blocking time | Nguyên nhân |
+|---|---|---|
+| **WiFi** (`WiFiClient` → lwIP DMA) | 2–20 ms | Syscall, không chờ ACK (QoS 0) |
+| **4G** (`TinyGsmClient` → AT UART 115200) | 150–700 ms | `AT+CIPSEND` + 500 byte × 10bit/115200 = 43ms UART + modem GPRS round-trip |
+
+`modbusTask` chạy Core 0 độc lập → **không bị ảnh hưởng** dù backfill block bao lâu.  
+`doAdcPoll()` (period 2000ms): WiFi 20ms = 1% trễ bỏ qua; 4G 700ms = 35% nhưng mẫu không mất, chỉ trễ — chấp nhận được.  
+→ Giữ **1 file/cycle** và guard **15s** là đúng cho cả 2 transport. Không thể tăng file/cycle trên 4G.
+
+#### Bug 1 — Spin trong cửa sổ 45–60s (`data_collector.cpp`)
+
+**Nguyên nhân:** `lastBackfillMs = now` chỉ được reset khi `!realtimeImminent`. Khi `realtimeImminent = true` (t ≈ 45–60s), timer không reset → `loop()` re-enter check mỗi ~1ms → **spin ~15 giây** (15.000 lần/chu kỳ).
+
+**Phân tích đủ case:**
+- Boot bình thường: `millis() + PUBLISH_INTERVAL_MS` bị **unsigned wrap** → fire ngay t≈0 nhưng `mqtt_is_connected()=false` → safe, vô hại
+- WDT/exception reset: giống boot bình thường
+- `millis()` wrap (49.7 ngày): unsigned arithmetic tự xử lý đúng, không lỗi
+- Debug mode bật: `doPublish(); return` → backfill block không chạy → `lastBackfillMs` không reset qua nhánh normal → khi tắt debug fire ngay → mqtt guard
+- **Steady-state t=45–60s**: đây là case spin thực sự
+
+**Fix:** dời `lastBackfillMs = now` ra ngoài, luôn reset trước khi kiểm tra `realtimeImminent`.  
+Đồng thời xoá comment `millis() + PUBLISH_INTERVAL_MS` sai (giờ dùng `millis()` thẳng, guard đủ).
+
+#### Bug 2 — Stuck file khi `mqtt_publish_data()` fail liên tiếp (`data_collector.cpp`)
+
+**Nguyên nhân:** khi `ok = false`, file không bị xóa và không có cơ chế skip → nếu cùng 1 file cứ fail mãi → **chặn toàn bộ backfill queue vĩnh viễn**.
+
+**Nguyên nhân file fail liên tiếp (khác với mất mạng bình thường):**
+- **WiFi**: TCP drop xảy ra ngay sau `mqtt.connected()` check (race window nhỏ) → PubSubClient chưa kịp phát hiện mất mạng → `publish()` trả `false`
+- **4G**: AT glitch / modem UART buffer kẹt state → `AT+CIPSEND` không nhận "SEND OK" → fail mà `mqtt.connected()` vẫn `true`
+- Các case trên thường tự phục hồi sau 1–2 chu kỳ reconnect, nhưng nếu không → stuck mãi không có cách thoát
+
+**Cần phân biệt với mất mạng thực:** mất mạng thực → `mqtt.connected()=false` → `doBackfillCycle()` return ngay ở đầu → không stuck, chờ reconnect.
+
+**Fix:** thêm `s_bfFailPath` + `s_bfFailCount`. Cùng 1 path fail **≥ 3 lần liên tiếp** → xóa file + `err_log` → reset counter. Ngưỡng 3 đủ để bỏ qua transient drop nhưng không để stuck mãi.  
+Reset counter về 0 ngay khi gửi thành công (path mới hoặc ok=true).
+
+#### `src/data_collector.cpp`
+- **Fix Bug 1 — spin guard**: `lastBackfillMs = now` dời ra ngoài `if (!realtimeImminent)` → luôn reset mỗi 15s, không spin
+- **Fix init unsigned wrap**: `millis() + PUBLISH_INTERVAL_MS` → `millis()` vì phép cộng wrap và fire ngay anyway; `realtimeImminent` guard đủ bảo vệ slot realtime đầu tiên
+- **Fix Bug 2 — stuck-file guard**: thêm `s_bfFailPath` (String) + `s_bfFailCount` (uint8_t); file cùng path fail ≥ 3 lần liên tiếp → `sd_remove()` + `err_log("BACKFILL","Skip stuck: path")` → tránh block queue; reset về 0 khi gửi OK
+- **Thêm comment phân tích WiFi vs 4G** trong backfill block của `data_collector_update()` — ghi rõ lý do giữ 1 file/cycle và guard 15s
+
+---
+
+### [2026-04-16] — Ổn định 4G, nút bấm, backfill priority
+
+#### `src/mqtt_client.cpp`
+- **`setKeepAlive(30)` → `setKeepAlive(60)`**: tránh broker ngắt kết nối do keepalive timeout khi Modbus poll block tới 30s
+- **`justConnected` — kiểm tra return value `mqttPublishLarge()`**: trước đây bỏ qua lỗi publish config → TCP stream bị corrupt → broker ngắt → device kẹt reconnect vô tận (root cause của "4G chỉ gửi 1 lần")
+- **`mqtt_publish_data()` — xóa `mqtt.disconnect()` khi publish fail**: trên 4G, disconnect → `AT+CIPCLOSE` → socket stuck TIME_WAIT → subsequent `connect()` fail lặp vô tận; giờ để PubSubClient tự phát hiện qua keepalive
+
+#### `src/data_collector.cpp`
+- **Backfill delay khởi động**: `millis() + 30000` → `millis() + PUBLISH_INTERVAL_MS (60s)` — backfill đầu tiên luôn sau realtime đầu tiên, không cướp slot
+- **Reset backfill timer sau mỗi `doPublish()`**: `lastBackfillMs = now` — không chạy backfill ngay sau khi vừa gửi realtime
+- **Guard `realtimeImminent`**: nếu realtime tiếp theo còn ≤ `BACKFILL_INTERVAL_MS` (15s) nữa → skip backfill lần đó → realtime luôn được ưu tiên
+
+#### `src/main.cpp`
+- **`btn_task` priority: 2 → 4** (cao hơn `modbusTask` priority 3): `ModbusMaster` và TCP `readBytes()` dùng busy-wait không có `yield()` → starvation `btn_task` lên tới 20s trong worst‑case poll; giờ `btn_task` preempt ngay
+- **`wifi_connect_from_config()` — check `s_apModeRequest`**: vòng lặp chờ WiFi thoát ngay khi long press được nhận, không đợi hết timeout 10s
+- **WiFi reconnect trong `loop()` — check `s_apModeRequest`**: tương tự, thoát vòng reconnect ngay khi user bấm nút
+
+#### `src/modbus_tcp.cpp`
+- **`readBytes()` — thêm `taskYIELD()`**: khi không có byte TCP sẵn → yield CPU → `btn_task` chạy đúng 10ms tick, không bị block trong suốt TCP_READ_TIMEOUT
+
 
 ## 1. Tổng quan
 

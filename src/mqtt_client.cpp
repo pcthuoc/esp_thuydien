@@ -11,19 +11,11 @@
 #include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 
 // Default WiFiClient — dùng khi chưa gọi mqtt_set_client()
 static WiFiClient   s_wifiClient;
 static Client*      s_activeClient = &s_wifiClient;
 static PubSubClient mqtt(*s_activeClient);
-
-// Mutex bảo vệ TinyGsmClient/WiFiClient khỏi race condition giữa:
-//   - Core 1: mqtt_update() → mqtt.loop() (read socket + PINGREQ)
-//   - Core 0: backfillTask → mqtt_publish_data() → mqtt.publish() (write socket)
-// Cả 2 core cùng dùng 1 Client → không guard → garbled AT stream → "lid invalid" → drop 4G
-static SemaphoreHandle_t s_mqttMutex = nullptr;
 
 // Config
 static String cfg_broker;
@@ -48,7 +40,8 @@ static const unsigned long RECONNECT_INTERVAL = 5000; // 5s
 static bool justConnected = false;
 
 // Config change callback
-static void (*onConfigChanged)() = nullptr;
+static void (*onConfigChanged)(const char* module) = nullptr;
+static void (*onConfigChangedSimple)() = nullptr;
 
 // Forward declarations
 static String buildDeviceConfig();
@@ -304,10 +297,13 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
                 // Gửi ACK nhỏ gọn (không echo full config → tránh loop)
                 String ack = "{\"source\":\"device\",\"ack\":true,\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                 mqtt.publish(topic_config.c_str(), ack.c_str(), false);
+                // Notify reload: gọi callback với từng module đã được update
+                const char* updatedModules[] = {"analog", "encoder", "di", "rs485", "tcp"};
+                for (const char* mod : updatedModules) {
+                    if (onConfigChanged) onConfigChanged(mod);
+                }
+                if (onConfigChangedSimple) onConfigChangedSimple();
                 LOGLN_IF(LOG_MQTT, "[MQTT] Config applied, ACK sent");
-
-                // Notify data_collector to reload calc configs
-                if (onConfigChanged) onConfigChanged();
             }
         }
     }
@@ -561,9 +557,7 @@ bool mqtt_init() {
     mqtt.setBufferSize(4096);
     mqtt.setServer(cfg_broker.c_str(), cfg_port);
     mqtt.setCallback(mqttCallback);
-    mqtt.setKeepAlive(30);  // 4G unstable — 30s detect drop nhanh hơn 60s
-
-    if (!s_mqttMutex) s_mqttMutex = xSemaphoreCreateMutex();
+    mqtt.setKeepAlive(60);
 
     LOG_IF(LOG_MQTT, "[MQTT] Init OK: %s:%d device=%s\n",
         cfg_broker.c_str(), cfg_port, cfg_device_id.c_str());
@@ -572,6 +566,11 @@ bool mqtt_init() {
 
 // Track trạng thái kết nối để phát hiện lúc vừa mất kết nối
 static bool _wasMqttConnected = false;
+
+// Cooldown buildDeviceConfig() — tránh gọi liên tục khi 4G connect/drop bão
+// Mỗi lần gọi tốn ~14KB heap đồng thời (5 JsonDoc + 5 String file + 1 output String)
+static unsigned long s_lastConfigPublishMs = 0;
+#define CONFIG_PUBLISH_COOLDOWN_MS  300000UL  // 5 phút
 
 void mqtt_update() {
     // Cho phép chạy cả khi WiFi không có (4G mode dùng TinyGsmClient)
@@ -594,12 +593,7 @@ void mqtt_update() {
         }
     } else {
         _wasMqttConnected = true;
-        // Guard mqtt.loop() bằng mutex — tránh race với backfillTask (Core 0)
-        // đang gọi mqtt_publish_data() cùng lúc trên cùng TinyGsmClient
-        if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            mqtt.loop();
-            xSemaphoreGive(s_mqttMutex);
-        }
+        mqtt.loop();
 
         // Sau khi vừa kết nối: gửi online + config
         if (justConnected) {
@@ -631,17 +625,24 @@ void mqtt_update() {
 
             String statusMsg;
             serializeJson(statusDoc, statusMsg);
-            if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                mqtt.publish(topic_status.c_str(), statusMsg.c_str(), false);
-                xSemaphoreGive(s_mqttMutex);
-            }
+            mqtt.publish(topic_status.c_str(), statusMsg.c_str(), false);
             LOGLN_IF(LOG_MQTT, "[MQTT] Published: online status");
 
             // Publish device config (streaming — không giới hạn bởi buffer)
-            String cfgMsg = buildDeviceConfig();
-            if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-                mqttPublishLarge(topic_config.c_str(), cfgMsg);
-                xSemaphoreGive(s_mqttMutex);
+            // Cooldown 5 phút: tránh đọc 5 file SD + 6 JsonDoc đồng thời khi 4G reconnect bão
+            unsigned long nowMs = millis();
+            if (nowMs - s_lastConfigPublishMs >= CONFIG_PUBLISH_COOLDOWN_MS) {
+                s_lastConfigPublishMs = nowMs;
+                String cfgMsg = buildDeviceConfig();
+                if (!mqttPublishLarge(topic_config.c_str(), cfgMsg)) {
+                    // Config fail (thường gặp trên 4G khi payload > 1460 bytes/AT+CIPSEND)
+                    // Không force disconnect — để keepalive phát hiện trạng thái TCP tự nhiên
+                    LOGLN_IF(LOG_MQTT, "[MQTT] Config publish FAIL (transport limit?)");
+                    err_log("MQTT", "Config publish FAIL on connect");
+                }
+            } else {
+                LOG_IF(LOG_MQTT, "[MQTT] Config publish skipped (cooldown %lus remaining)\n",
+                       (CONFIG_PUBLISH_COOLDOWN_MS - (nowMs - s_lastConfigPublishMs)) / 1000);
             }
         }
     }
@@ -656,18 +657,14 @@ bool mqtt_publish_data(const String& json) {
         LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAILED: not connected");
         return false;
     }
-    bool ok = false;
-    if (s_mqttMutex && xSemaphoreTake(s_mqttMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-        ok = mqtt.publish(topic_data.c_str(), json.c_str(), false);
-        if (!ok) {
-            // TCP socket chết ở tầng modem — force disconnect trong mutex
-            // để mqtt.loop() (cùng core) không chen vào giữa
-            mqtt.disconnect();
-            LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAIL → forced disconnect để trigger reconnect");
-        }
-        xSemaphoreGive(s_mqttMutex);
-    }
+    bool ok = mqtt.publish(topic_data.c_str(), json.c_str(), false);
     LOG_IF(LOG_MQTT, "[MQTT] Published data (%d bytes) -> %s\n", json.length(), ok ? "OK" : "FAIL");
+    if (!ok) {
+        LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAIL");
+        err_log("MQTT", "publish_data FAIL");
+        // Không force disconnect: trên 4G, disconnect → AT+CIPCLOSE → socket stuck
+        // PubSubClient tự phát hiện mất kết nối qua keepalive và reconnect sạch hơn
+    }
     return ok;
 }
 
@@ -691,8 +688,12 @@ bool mqtt_publish_config(const String& json) {
     return ok;
 }
 
-void mqtt_set_config_callback(void (*cb)()) {
+void mqtt_set_config_callback(void (*cb)(const char* module)) {
     onConfigChanged = cb;
+}
+
+void mqtt_set_config_callback_simple(void (*cb)()) {
+    onConfigChangedSimple = cb;
 }
 
 void mqtt_keep_alive() {

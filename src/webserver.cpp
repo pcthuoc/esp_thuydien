@@ -13,6 +13,11 @@
 
 static AsyncWebServer server(80);
 static bool running = false;
+static WebConfigSavedCallback s_configSavedCb = nullptr;
+
+void webserver_set_config_saved_callback(WebConfigSavedCallback cb) {
+    s_configSavedCb = cb;
+}
 
 // ============================================================
 // Helpers
@@ -106,6 +111,7 @@ static void api_post_config(AsyncWebServerRequest* request, uint8_t* data, size_
         if (sd_write_file(path.c_str(), body.c_str())) {
             request->send(200, "application/json", "{\"ok\":true}");
             Serial.printf("[WEB] Config saved: %s\n", path.c_str());
+            if (s_configSavedCb) s_configSavedCb(module.c_str());
         } else {
             request->send(500, "application/json", "{\"error\":\"SD write failed\"}");
         }

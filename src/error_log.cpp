@@ -3,8 +3,9 @@
 #include "ntp_rtc.h"
 #include <time.h>
 
-#define LOG_DIR    "/logs"
-#define LOG_MAX    (256 * 1024)   // 256 KB per file
+#define LOG_DIR      "/logs"
+#define LOG_MAX      (64 * 1024)    // 64 KB per file — rotate sớm hơn, zero heap cost (dùng rename)
+#define LOG_MAX_FILES 14            // Giữ tối đa 14 files (~7 ngày × 2 files/ngày)
 
 static void ensureDir() {
     if (!sd_exists(LOG_DIR)) {
@@ -23,18 +24,37 @@ static String getLogPath() {
     return String(buf);
 }
 
-// Rotate: xóa file nếu quá lớn
+// Rotate: đổi tên file cũ → _old.log, tạo file mới
+// KHÔNG đọc nội dung vào RAM — tránh heap spike 256+ KB
 static void rotateIfNeeded(const String& path) {
     if (!sd_exists(path.c_str())) return;
-    String content = sd_read_file(path.c_str());
-    if ((long)content.length() < LOG_MAX) return;
+    long sz = sd_file_size(path.c_str());
+    if (sz < LOG_MAX) return;
 
-    Serial.printf("[ERRLOG] Rotate: %s (%d bytes)\n", path.c_str(), content.length());
+    Serial.printf("[ERRLOG] Rotate: %s (%ld bytes)\n", path.c_str(), sz);
     String oldPath = path.substring(0, path.length() - 4) + "_old.log";
     if (sd_exists(oldPath.c_str())) sd_remove(oldPath.c_str());
-    sd_write_file(oldPath.c_str(), content.c_str());
-    sd_remove(path.c_str());
+    sd_rename(path.c_str(), oldPath.c_str());
 }
+
+// Xóa log cũ — giữ tối đa LOG_MAX_FILES files trong /logs/
+// Files được sắp xếp tăng dần (tên = ngày) → xóa đầu danh sách = xóa cũ nhất
+static void cleanupOldLogs() {
+    auto files = sd_list_dir(LOG_DIR);
+    if ((int)files.size() <= LOG_MAX_FILES) return;
+
+    int toDelete = (int)files.size() - LOG_MAX_FILES;
+    Serial.printf("[ERRLOG] Cleanup: %d files, xóa %d file cũ nhất\n",
+                  (int)files.size(), toDelete);
+    for (int i = 0; i < toDelete; i++) {
+        String p = String(LOG_DIR) + "/" + files[i];
+        sd_remove(p.c_str());
+        Serial.printf("[ERRLOG] Deleted old log: %s\n", p.c_str());
+    }
+}
+
+// Track ngày cuối cleanup — chỉ chạy 1 lần/ngày
+static int s_lastCleanupDay = -1;
 
 void err_log(const char* tag, const char* msg) {
     if (!sd_is_inserted()) return;
@@ -42,6 +62,15 @@ void err_log(const char* tag, const char* msg) {
 
     String path = getLogPath();
     rotateIfNeeded(path);
+
+    // Cleanup log cũ 1 lần/ngày
+    time_t now = ntp_rtc_get_epoch();
+    struct tm t;
+    localtime_r(&now, &t);
+    if (t.tm_mday != s_lastCleanupDay) {
+        s_lastCleanupDay = t.tm_mday;
+        cleanupOldLogs();
+    }
 
     String ts = ntp_rtc_get_datetime();  // "YYYY-MM-DD HH:MM:SS"
     String line = "[" + ts + "] [" + tag + "] " + msg + "\n";
@@ -63,7 +92,5 @@ void err_log_clear() {
 
 long err_log_size() {
     String path = getLogPath();
-    if (!sd_exists(path.c_str())) return -1;
-    String content = sd_read_file(path.c_str());
-    return (long)content.length();
+    return sd_file_size(path.c_str());  // không đọc content vào RAM
 }

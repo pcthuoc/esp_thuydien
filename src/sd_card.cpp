@@ -3,6 +3,33 @@
 #include <FS.h>
 #include <algorithm>
 
+// ============================================================
+// Auto-reinit khi SD write lỗi liên tiếp
+// ============================================================
+static int s_writeFailCount = 0;
+#define SD_FAIL_REINIT_THRESHOLD 3
+
+static void _on_write_success() {
+    s_writeFailCount = 0;
+}
+
+static void _on_write_failure(const char* path) {
+    s_writeFailCount++;
+    Serial.printf("[SD] Write fail (%d/%d): %s\n",
+                  s_writeFailCount, SD_FAIL_REINIT_THRESHOLD, path);
+    if (s_writeFailCount >= SD_FAIL_REINIT_THRESHOLD) {
+        s_writeFailCount = 0;
+        Serial.println("[SD] Consecutive write failures — reinit SD...");
+        SD_MMC.end();
+        delay(200);
+        if (sd_init()) {
+            Serial.println("[SD] Reinit OK");
+        } else {
+            Serial.println("[SD] Reinit FAILED");
+        }
+    }
+}
+
 bool sd_init() {
     pinMode(SD_DET_PIN, INPUT_PULLUP);
 
@@ -32,6 +59,13 @@ bool sd_init() {
     return true;
 }
 
+bool sd_reinit() {
+    SD_MMC.end();
+    delay(200);
+    s_writeFailCount = 0;
+    return sd_init();
+}
+
 bool sd_is_inserted() {
     return digitalRead(SD_DET_PIN) == LOW;
 }
@@ -44,11 +78,13 @@ bool sd_write_file(const char* path, const char* content) {
 
     File file = SD_MMC.open(path, FILE_WRITE);
     if (!file) {
-        Serial.printf("[SD] Failed to open %s for writing\n", path);
+        _on_write_failure(path);
         return false;
     }
     bool ok = file.print(content);
     file.close();
+    if (ok) _on_write_success();
+    else    _on_write_failure(path);
     return ok;
 }
 
@@ -60,11 +96,13 @@ bool sd_append_file(const char* path, const char* content) {
 
     File file = SD_MMC.open(path, FILE_APPEND);
     if (!file) {
-        Serial.printf("[SD] Failed to open %s for append\n", path);
+        _on_write_failure(path);
         return false;
     }
     bool ok = file.print(content);
     file.close();
+    if (ok) _on_write_success();
+    else    _on_write_failure(path);
     return ok;
 }
 
@@ -85,6 +123,18 @@ bool sd_exists(const char* path) {
 
 bool sd_remove(const char* path) {
     return SD_MMC.remove(path);
+}
+
+bool sd_rename(const char* from, const char* to) {
+    return SD_MMC.rename(from, to);
+}
+
+long sd_file_size(const char* path) {
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return -1;
+    long sz = (long)f.size();
+    f.close();
+    return sz;
 }
 
 // Tạo thư mục kể cả các cấp cha chưa tồn tại (giống mkdir -p)

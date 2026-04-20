@@ -10,7 +10,7 @@
 #define BUS1_RX  17
 #define BUS1_TX  18
 
-#define BUS1_SERIAL  Serial1
+#define BUS1_SERIAL  Serial2  // Serial1 đã dùng cho modem 4G (GPIO15/16)
 
 // Delay giữa các request Modbus (ms) — tránh slave chưa kịp xử lý
 #define MODBUS_REQUEST_DELAY  50

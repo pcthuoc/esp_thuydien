@@ -15,6 +15,9 @@ bool ntp_rtc_sync_ntp();
 // Gọi trong loop() — tự sync NTP định kỳ
 void ntp_rtc_update();
 
+// Reset timer để ntp_rtc_update() sync sớm (sau reconnect) — KHÔNG block
+void ntp_rtc_force_resync();
+
 // Lấy epoch (seconds since 1970)
 time_t ntp_rtc_get_epoch();
 

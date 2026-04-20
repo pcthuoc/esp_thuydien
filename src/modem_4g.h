@@ -3,9 +3,9 @@
 #include <Client.h>
 
 // ============================================================
-// Modem 4G — A7680C via TinyGSM (SIM7600 AT set)
-// UART: ESP RX = GPIO15 ← SIM TXD
-//       ESP TX = GPIO16 → SIM RXD
+// Modem 4G — A7680C (SIM7600 AT command set) via TinyGSM
+// UART: TX = GPIO15 → SIM RXD
+//       RX = GPIO16 ← SIM TXD
 // ============================================================
 
 // Khởi tạo modem: connect GPRS, sẵn sàng gửi data
@@ -30,3 +30,11 @@ Client* modem_4g_get_client();
 // Sync system clock từ mạng 4G qua AT+CCLK? (không cần WiFi)
 // Tự động set system time và log chi tiết để debug
 bool modem_4g_sync_time();
+
+// Đăng ký tick callback — được gọi mỗi 1 giây trong các vòng chờ blocking
+// Dùng để gọi led_update() từ main trong lúc modem đang chờ
+void modem_4g_set_tick_cb(void (*cb)());
+
+// Yêu cầu hủy quá trình init/reconnect đang block (gọi từ task khác)
+// Sau khi abort, modem_4g_init() / modem_4g_reconnect() trả về false ngay
+void modem_4g_abort();

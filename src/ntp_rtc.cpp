@@ -198,6 +198,14 @@ void ntp_rtc_update() {
     }
 }
 
+// Reset timer để lần gọi ntp_rtc_update() tiếp theo sẽ sync ngay
+// Dùng sau khi WiFi reconnect — KHÔNG block loop()
+void ntp_rtc_force_resync() {
+    ntpSynced = false;
+    lastSyncAttempt = 0;  // force sync ngay trong vòng lặp tiếp theo
+    Serial.println("[NTP] Force resync scheduled");
+}
+
 time_t ntp_rtc_get_epoch() {
     time_t now;
     time(&now);

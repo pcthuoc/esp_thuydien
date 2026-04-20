@@ -3,13 +3,13 @@
 // ============================================================
 // Bật/tắt log từng module — 1 = bật, 0 = tắt
 // ============================================================
-#define LOG_MBTCP     0   // Modbus TCP
-#define LOG_MODBUS    0   // Modbus RTU
-#define LOG_ADS       0   // Analog (ADS1115)
-#define LOG_DATA      0   // Data collector / publish
+#define LOG_MBTCP     1   // Modbus TCP
+#define LOG_MODBUS    1   // Modbus RTU
+#define LOG_ADS       1   // Analog (ADS1115)
+#define LOG_DATA      1   // Data collector / publish
 #define LOG_MQTT      1   // MQTT client
 #define LOG_OTA       1   // OTA update
-#define LOG_COUNTER   0   // Encoder / counter
+#define LOG_COUNTER   1   // Encoder / counter
 #define LOG_SD        1   // SD card
 #define LOG_WEB       1   // Web server
 #define LOG_NTP       1   // NTP / RTC

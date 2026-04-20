@@ -25,7 +25,8 @@
 // ============================================================
 // State
 // ============================================================
-static bool             s_initialized = false;
+static bool             s_initialized  = false;
+static volatile bool    s_gprsFlag     = false;  // đọc bởi Core 1 — KHÔNG dùng AT
 static TinyGsm          s_modem(SerialAT);
 static TinyGsmClient    s_client(s_modem);
 static String           s_apn = "";
@@ -101,11 +102,18 @@ bool modem_4g_init(const char* apn, const char* pin) {
     err_log("4G", "GPRS connected, IP=" + modem_4g_ip());
 
     s_initialized = true;
+    s_gprsFlag    = true;  // init thành công → GPRS sẵn sàng
     return true;
 }
 
 bool modem_4g_is_connected() {
-    return s_initialized && s_modem.isGprsConnected();
+    // Đọc flag — không gọi AT command.
+    // Flag được set bởi modem_4g_init/reconnect và net4g_task.
+    return s_initialized && s_gprsFlag;
+}
+
+void modem_4g_set_gprs_flag(bool connected) {
+    s_gprsFlag = connected;
 }
 
 bool modem_4g_reconnect() {
@@ -132,9 +140,11 @@ bool modem_4g_reconnect() {
 
     if (!s_modem.gprsConnect(s_apn.c_str())) {
         err_log("4G", "Reconnect: GPRS FAILED");
+        s_gprsFlag = false;
         return false;
     }
 
+    s_gprsFlag = true;  // reconnect thành công
     err_log("4G", "Reconnected, IP=" + modem_4g_ip());
     return true;
 }

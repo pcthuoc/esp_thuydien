@@ -8,6 +8,7 @@
 #include "button.h"
 #include "webserver.h"
 #include "mqtt_client.h"
+#include "net4g_task.h"
 #include "ntp_rtc.h"
 #include "analog_reader.h"
 #include "counter.h"
@@ -28,15 +29,12 @@ static bool mqttInited     = false;   // mqtt_init() đã được gọi
 // --- AP mode request flag (set từ btn_task Core 0, xử lý ở loop() Core 1) ---
 static volatile bool s_apModeRequest = false;
 
-// --- Network check timer ---
+// --- WiFi reconnect flag (set từ wifi_task Core 0, xử lý ở loop() Core 1) ---
+static volatile bool s_wifiJustReconnected = false;
+
+// --- Network check timer (chỉ dùng cho cần thiết, không block) ---
 static unsigned long lastNetCheck = 0;
 static const unsigned long NET_CHECK_INTERVAL = 15000;  // 15s
-
-// --- 4G time sync ---
-static unsigned long last4gTimeSync = 0;
-static const unsigned long SYNC_4G_OK_INTERVAL   = 3600000UL;
-static const unsigned long SYNC_4G_FAIL_INTERVAL  = 60000UL;
-static bool timeSynced4g = false;
 
 // --- WiFi connect helper ---
 static bool wifi_connect_from_config() {
@@ -121,7 +119,59 @@ void onButtonClick() {
 void onButtonLongPress() {
     Serial.println("[BTN] Long press (3s) -> AP MODE requested");
     modem_4g_abort();       // an toàn: chỉ set volatile bool
+    net4g_abort();          // dừng net4g reconnect nếu đang chạy
     s_apModeRequest = true; // loop() sẽ xử lý trên Core 1
+}
+
+// ============================================================
+// wifi_task — Core 0, priority 2 (WiFi mode only)
+//
+// Phương án A: chuyển WiFi reconnect ra khỏi Core 1.
+// WiFi.reconnect() an toàn từ bất kỳ core nào (lwIP thread-safe).
+// delay() trong FreeRTOS task = vTaskDelay() → yield, KHÔNG block Core 1.
+// ============================================================
+static void wifi_reconnect_task(void* pv) {
+    for (;;) {
+        // Chờ 15s giữa các lần kiểm tra
+        vTaskDelay(pdMS_TO_TICKS(15000));
+
+        // 4G mode → task này không làm gì cả
+        if (mode4G) continue;
+
+        // AP mode đang chạy → không cần reconnect
+        if (s_apModeRequest || webserver_is_running()) continue;
+        if (!wifiConfigured) continue;
+
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WIFI] Mất kết nối, reconnect... (Core 0)");
+            err_log("WIFI", "Disconnected — reconnecting");
+
+            WiFi.reconnect();
+
+            // Chờ tối đa 10s — delay() ở đây = vTaskDelay(), Core 1 vẫn chạy bình thường
+            int t = 20;
+            while (WiFi.status() != WL_CONNECTED && t-- > 0) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                if (s_apModeRequest) { WiFi.disconnect(false, false); break; }
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                // Set DNS (lwIP thread-safe)
+                ip_addr_t dns1 = IPADDR4_INIT_BYTES(8, 8, 8, 8);
+                ip_addr_t dns2 = IPADDR4_INIT_BYTES(1, 1, 1, 1);
+                dns_setserver(0, &dns1);
+                dns_setserver(1, &dns2);
+                Serial.printf("[WIFI] Reconnected: %s  DNS: 8.8.8.8\n",
+                              WiFi.localIP().toString().c_str());
+                err_log("WIFI", "Reconnected");
+                // Báo Core 1 xử lý NTP resync + LED (không gọi từ đây vì không thread-safe)
+                s_wifiJustReconnected = true;
+            } else {
+                Serial.println("[WIFI] Reconnect thất bại");
+                err_log("WIFI", "Reconnect FAILED");
+            }
+        }
+    }
 }
 
 void setup() {
@@ -166,6 +216,13 @@ void setup() {
         "btn_task", 2048, nullptr, 4, nullptr, 0  // Core 0, prio 4 > modbusTask(3)
     );
 
+    // wifi_reconnect_task khởi động sau — sẽ tự skip nếu mode4G hoặc !wifiConfigured
+    // (mode4G chưa được set ở đây, nhưng task tự check wifiConfigured và WiFi.status())
+    xTaskCreatePinnedToCore(
+        wifi_reconnect_task, "wifi_task", 4096, nullptr, 2, nullptr, 0
+        // Core 0, prio 2 — thấp hơn btn(4) và mb_poll(3); cao hơn loop(1)
+    );
+
     // Đăng ký tick callback cho modem 4G — chỉ cần led_update()
     // (button_update() đã có task riêng)
     modem_4g_set_tick_cb([]() {
@@ -193,9 +250,9 @@ void setup() {
     counter_init();
     Serial.println("[BOOT] Counter OK (E1=GPIO47, E2=GPIO48)");
 
-    // Init Rain gauge (DI1)
+    // Init Rain gauge (DI4)
     rain_init();
-    Serial.println("[BOOT] Rain gauge OK (DI1=GPIO1)");
+    Serial.println("[BOOT] Rain gauge OK (DI4=GPIO40)");
 
     // Đọc config mạng
     String netModeStr = "wifi";
@@ -222,15 +279,16 @@ void setup() {
         const char* pin4g = (simPin.length() > 0) ? simPin.c_str() : nullptr;
         if (!s_apModeRequest && modem_4g_init(simApn.c_str(), pin4g)) {
             modem4gInited = true;
-            timeSynced4g = modem_4g_sync_time();
+            // Time sync ban đầu (blocking, chạy 1 lần trong setup — OK)
+            bool timeSynced4g = modem_4g_sync_time();
             if (timeSynced4g) {
                 ntp_rtc_write_rtc();
                 Serial.printf("[BOOT] 4G time OK: %s\n", ntp_rtc_get_datetime().c_str());
             } else {
                 Serial.println("[BOOT] 4G time sync FAILED — dùng RTC dự phòng");
             }
-            last4gTimeSync = millis();
-            mqtt_set_client(modem_4g_get_client());
+            // mqtt_init() chỉ đọc config SD — KHÔNG cần set client cho 4G nữa
+            // (net4g_task sẽ tự tạo PubSubClient với TinyGsmClient)
             if (mqtt_init()) {
                 mqttInited = true;
                 led_set_state(LedState::MQTT_CONNECTING);
@@ -238,6 +296,12 @@ void setup() {
             } else {
                 led_set_state(LedState::ONLINE_OK);
                 Serial.println("[BOOT] MQTT chưa cấu hình");
+            }
+            // Khởi động net4g_task (Core 0, prio 2) — sở hữu Serial1 từ đây trở đi
+            // mqttCallback_public: forward received messages về Core 1 qua net4g rx queue
+            if (mqttInited) {
+                net4g_task_start(mqttCallback_public);
+                Serial.println("[BOOT] net4g_task started (Core 0)");
             }
         } else {
             led_set_state(LedState::OFFLINE_BUFFERING);
@@ -351,64 +415,27 @@ void loop() {
 
     if (webserver_is_running()) return;
 
+    // --- WiFi: xử lý kết quả từ wifi_reconnect_task (Core 0) ---
+    // Không blocking — chỉ xử lý LED + NTP trigger khi wifi_task báo reconnected
+    if (!mode4G && s_wifiJustReconnected) {
+        s_wifiJustReconnected = false;
+        ntp_rtc_force_resync();  // reset timer, ntp_rtc_update() sẽ sync sớm
+        led_set_state(LedState::MQTT_CONNECTING);
+        Serial.println("[WIFI] Reconnect detected → NTP resync triggered");
+    }
+
+    // --- LED: cập nhật trạng thái offline nếu mất mạng ---
     unsigned long now = millis();
     if (now - lastNetCheck >= NET_CHECK_INTERVAL) {
         lastNetCheck = now;
 
         if (!mode4G) {
-            // --- WiFi reconnect ---
+            // WiFi: reconnect đã được xử lý bởi wifi_task (Core 0) — không làm gì ở đây
             if (WiFi.status() != WL_CONNECTED && wifiConfigured) {
-                Serial.println("[WIFI] Mất kết nối, reconnect...");
-                err_log("WIFI", "Disconnected — reconnecting");
-                led_set_state(LedState::WIFI_CONNECTING);
-                WiFi.reconnect();
-                int t = 20;
-                while (WiFi.status() != WL_CONNECTED && t-- > 0) {
-                    delay(500); led_update();
-                    // Thoát ngay nếu user bấm nút AP mode trong khi đang tự reconnect WiFi
-                    if (s_apModeRequest) { WiFi.disconnect(false, false); break; }
-                }
-                if (WiFi.status() == WL_CONNECTED) {
-                    // WiFi.reconnect() không refresh DNS từ DHCP → set thủ công qua lwIP
-                    ip_addr_t dns1 = IPADDR4_INIT_BYTES(8, 8, 8, 8);
-                    ip_addr_t dns2 = IPADDR4_INIT_BYTES(1, 1, 1, 1);
-                    dns_setserver(0, &dns1);
-                    dns_setserver(1, &dns2);
-                    Serial.printf("[WIFI] OK: %s  DNS: 8.8.8.8\n", WiFi.localIP().toString().c_str());
-                    err_log("WIFI", "Reconnected");
-                    // KHÔNG gọi ntp_rtc_sync_ntp() trực tiếp ở đây — sẽ block 5s trong loop()
-                    // ntp_rtc_update() trong loop() sẽ tự sync sau SYNC_FAIL_INTERVAL (60s)
-                    ntp_rtc_force_resync();  // Reset timer để sync sớm, không block ngay
-                    led_set_state(LedState::MQTT_CONNECTING);
-                } else {
-                    Serial.println("[WIFI] Reconnect thất bại, thử lại sau...");
-                    led_set_state(LedState::OFFLINE_BUFFERING);
-                }
-            }
-        } else {
-            // --- 4G reconnect ---
-            if (modem4gInited && !modem_4g_is_connected()) {
-                Serial.println("[4G] Mất kết nối, reconnect...");
-                err_log("4G", "Connection lost — reconnecting");
-                led_set_state(LedState::WIFI_CONNECTING);
-                if (modem_4g_reconnect()) {
-                    Serial.println("[4G] Reconnected!");
-                    timeSynced4g = modem_4g_sync_time();
-                    if (timeSynced4g) ntp_rtc_write_rtc();
-                    last4gTimeSync = millis();
-                    led_set_state(LedState::MQTT_CONNECTING);
-                } else {
-                    led_set_state(LedState::OFFLINE_BUFFERING);
-                }
-            }
-
-            // Periodic 4G time re-sync
-            unsigned long syncInterval = timeSynced4g ? SYNC_4G_OK_INTERVAL : SYNC_4G_FAIL_INTERVAL;
-            if (millis() - last4gTimeSync >= syncInterval) {
-                timeSynced4g = modem_4g_sync_time();
-                if (timeSynced4g) ntp_rtc_write_rtc();
-                last4gTimeSync = millis();
+                led_set_state(LedState::OFFLINE_BUFFERING);
             }
         }
+        // 4G: GPRS reconnect + MQTT reconnect + time sync đều do net4g_task (Core 0)
+        // loop() không cần làm gì thêm cho 4G
     }
 }

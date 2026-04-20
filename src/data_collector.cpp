@@ -16,13 +16,16 @@
 // ============================================================
 // Timing
 // ============================================================
-#define ADC_POLL_INTERVAL_MS    2000   // 2s → 30 mẫu/phút
+#define ADC_POLL_INTERVAL_MS    4000   // 4s → 15 mẫu/phút
 #define PUBLISH_INTERVAL_MS     60000  // 60s mỗi lần gửi
 
-// Modbus poll timeout (EventGroup wait) = 30s
-// Worst case: 20RTU×250ms + 5host×(1s+4×1s) = 5s + 25s = 30s
-// Với 5slave×4biến = 20ch RTU → ~5s | 20ch TCP 5host → ~20s
-#define MODBUS_POLL_TIMEOUT_MS  30000
+// Modbus poll timeout — thời gian tối đa chờ 1 chu kỳ poll hoàn thành
+// modbusTask poll liên tục, DONE set sau mỗi chu kỳ
+// Normal mode xEventGroupWaitBits() với timeout này trước khi publish
+// RTU: 20 × (300ms timeout + 50ms gap) = 7,000ms
+// TCP: 5 host × (500ms connect + 4ch×400ms read) = 10,500ms
+// Total worst case: ~17.5s → set 25s để có margin
+#define MODBUS_POLL_TIMEOUT_MS  25000
 
 // ============================================================
 // Calc config
@@ -60,6 +63,11 @@ static uint16_t accCnt[ACC_ANALOG_COUNT];
 static unsigned long lastAdcPollMs  = 0;
 static unsigned long lastPublishMs  = 0;
 static bool debugMode = false;
+// Non-blocking DONE wait: khi đến giờ publish mà poll chưa xong, set flag và tiếp tục loop()
+// → mqtt_update(), led_update() vẫn chạy bình thường thay vì bị block 25s
+static bool s_waitingForDone = false;
+// Trigger timer độc lập cho debug mode (tránh trigger liên tục mỗi 4s)
+static unsigned long s_lastDebugTriggerMs = 0;
 
 // FreeRTOS sync primitives
 static EventGroupHandle_t s_mbEvent   = nullptr;
@@ -83,16 +91,14 @@ static void saveToSd(const String& payload, const String& ts);
 
 // ============================================================
 // Modbus poll task (Core 0, priority 3)
-// — Chờ trigger từ main loop, poll RTU+TCP, set DONE
-// — Không có delay() trong main loop → ADC luôn chạy đúng 2s
-// Timing worst case (20ch RTU + 20ch TCP 5host):
-//   RTU: 20 × (200ms timeout + 50ms gap) = 5,000ms
-//   TCP: 5 host × (1s connect + 4ch×1s read) = 25,000ms
-//   Total: ~30s = đúng bằng MODBUS_POLL_TIMEOUT_MS
+// — Chờ trigger từ data_collector_update(), poll xong → DONE, rồi block lại
+// — Block nhiều (chờ trigger) → net4g_task (priority 2) không bị starve
+// — Tại thời điểm publish, modbusTask đang BLOCK → không đụng vào channels[]
+//   → không có data race
 // ============================================================
 static void modbusTask(void* pv) {
     for (;;) {
-        // Chờ trigger (block vô hạn)
+        // Chờ trigger (block vô hạn) — nhường CPU cho net4g_task khi rảnh
         xEventGroupWaitBits(s_mbEvent, MB_BIT_TRIGGER, pdTRUE, pdTRUE, portMAX_DELAY);
 
         LOG_IF(LOG_DATA, "[DATA] Modbus poll start\n");
@@ -101,6 +107,8 @@ static void modbusTask(void* pv) {
         LOG_IF(LOG_DATA, "[DATA] Modbus poll done\n");
 
         xEventGroupSetBits(s_mbEvent, MB_BIT_DONE);
+        // Không tự re-trigger: chờ data_collector_update() fire trigger sau mỗi publish
+        // → an toàn: khi main đọc channels[] thì modbusTask đang block
     }
 }
 
@@ -276,8 +284,8 @@ static void loadCalcConfigs() {
         if (!deserializeJson(doc, json)) {
             JsonObject chs = doc["channels"];
             if (chs) {
-                if (chs["DI1"].is<JsonObject>())
-                    loadOneCalc(calcCfg[CALC_DI_OFF], chs["DI1"]);
+                if (chs["DI4"].is<JsonObject>())
+                    loadOneCalc(calcCfg[CALC_DI_OFF], chs["DI4"]);
             }
         }
     }
@@ -414,7 +422,7 @@ static void doPublish() {
         grp["ts"] = ts;
         uint32_t cnt = rain_get_count();
         float real = calcApply(calcCfg[CALC_DI_OFF], (float)cnt);
-        JsonObject ch = grp["DI1"].to<JsonObject>();
+        JsonObject ch = grp["DI4"].to<JsonObject>();
         ch["raw"] = cnt;
         ch["real"] = real;
     }
@@ -542,12 +550,14 @@ void data_collector_init(bool use4G) {
     // Tạo FreeRTOS primitives
     s_mbEvent  = xEventGroupCreate();
 
-    // Modbus poll task — Core 0, priority 3
-    xTaskCreatePinnedToCore(modbusTask, "mb_poll", 8192, nullptr, 3, nullptr, 0);
+    // Modbus poll task — Core 0, priority 2 (= net4g_task)
+    // Priority 3 cũ → net4g_task (prio 2) bị starve khi ModbusMaster busy-wait RTU
+    // Priority 2: round-robin với net4g → cả hai đều chạy được
+    xTaskCreatePinnedToCore(modbusTask, "mb_poll", 8192, nullptr, 2, nullptr, 0);
 
     // Backfill chạy inline trong data_collector_update() — không cần task riêng
 
-    // Trigger lần đầu ngay sau init
+    // Trigger lần đầu ngay sau init — bắt đầu poll cycle 1
     xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);
 
     LOG_IF(LOG_DATA, "[DATA] Init OK, debug=%s, adc=%ds, publish=%ds\n",
@@ -559,53 +569,70 @@ void data_collector_init(bool use4G) {
 void data_collector_update() {
     unsigned long now = millis();
 
-    // ADC poll mỗi 2s → 30 mẫu/phút (tích lũy trung bình)
-    // Không bị block bởi Modbus vì modbusTask chạy trên Core 0
+    // ADC poll mỗi 4s → 15 mẫu/phút (tích lũy trung bình)
     if (now - lastAdcPollMs >= ADC_POLL_INTERVAL_MS) {
         lastAdcPollMs = now;
         doAdcPoll();
     }
 
-    // Debug mode: gửi ngay sau ADC poll
-    if (debugMode && (now - lastAdcPollMs < 50)) {
-        doPublish();
+    // ── Debug mode ─────────────────────────────────────────────────────────────
+    // Trigger modbus mỗi MODBUS_POLL_TIMEOUT_MS, publish SAU KHI DONE set
+    // → đảm bảo modbus data luôn valid trước khi doPublish()
+    if (debugMode) {
+        if (rtuActive || tcpActive) {
+            EventBits_t bits = xEventGroupGetBits(s_mbEvent);
+            if (bits & MB_BIT_DONE) {
+                // Poll xong → publish ngay, rồi trigger lại
+                xEventGroupClearBits(s_mbEvent, MB_BIT_DONE);
+                doPublish();
+                // Trigger chu kỳ poll mới
+                xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);
+                s_lastDebugTriggerMs = now;
+                LOG_IF(LOG_DATA, "[DATA] Debug: poll done → published, re-trigger\n");
+            }
+            // DONE chưa set → modbusTask đang poll → không publish, chờ vòng tiếp
+        } else {
+            // Không có modbus → publish theo ADC (như cũ)
+            if (now - lastAdcPollMs < 50) {
+                doPublish();
+            }
+        }
         return;
     }
 
-    // Normal mode: publish mỗi 60s
-    // Chờ Modbus poll xong trước khi gửi (data luôn fresh)
-    if (!debugMode && now - lastPublishMs >= PUBLISH_INTERVAL_MS) {
-        lastPublishMs = now;
+    // ── Normal mode: publish mỗi PUBLISH_INTERVAL_MS ────────────────────────────
+    if (now - lastPublishMs >= PUBLISH_INTERVAL_MS || s_waitingForDone) {
 
-        // Chờ modbusTask xong (timeout = MODBUS_POLL_TIMEOUT_MS)
-        // Nếu timeout: vẫn publish với data cũ (valid flag = false cho kênh lỗi)
         if (rtuActive || tcpActive) {
-            xEventGroupWaitBits(s_mbEvent, MB_BIT_DONE,
-                                pdTRUE,   // xóa bit sau khi đọc
-                                pdTRUE,   // chờ tất cả bit set
-                                pdMS_TO_TICKS(MODBUS_POLL_TIMEOUT_MS));
+            // NON-BLOCKING check DONE — KHÔNG block loop() để mqtt_update() vẫn chạy
+            // Nếu DONE chưa set: set flag, return — thử lại vòng lặp tiếp theo (~1ms)
+            EventBits_t bits = xEventGroupGetBits(s_mbEvent);
+            if (!(bits & MB_BIT_DONE)) {
+                if (!s_waitingForDone) {
+                    s_waitingForDone = true;
+                    LOG_IF(LOG_DATA, "[DATA] Waiting for modbus DONE (non-blocking)...\n");
+                }
+                return;  // quay lại loop() → mqtt_update() chạy bình thường
+            }
+            // DONE set: xóa bit, tiến hành publish
+            xEventGroupClearBits(s_mbEvent, MB_BIT_DONE);
         }
 
+        // Tại đây modbusTask đang BLOCK (chờ TRIGGER mới) → không đụng channels[] → an toàn
+        lastPublishMs = now;
+        s_waitingForDone = false;
         doPublish();
-        lastBackfillMs = now;  // reset backfill timer: không chạy backfill ngay sau realtime
+        lastBackfillMs = now;
 
-        // Trigger chu kỳ Modbus mới ngay sau khi publish
-        xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);
+        // Trigger chu kỳ poll mới ngay sau publish
+        if (rtuActive || tcpActive) {
+            xEventGroupSetBits(s_mbEvent, MB_BIT_TRIGGER);
+        }
     }
 
     // Backfill: chỉ chạy khi "rảnh" — không tranh với cửa sổ realtime sắp đến
-    // Điều kiện: (1) đã qua BACKFILL_INTERVAL_MS từ lần gửi cuối
-    //            (2) realtime tiếp theo còn > BACKFILL_INTERVAL_MS nữa
-    //
-    // WiFi:  mqtt_publish_data() block ~2–20ms  → guard 15s cực kỳ conservative, OK
-    // 4G:    mqtt_publish_data() block 150–700ms (AT+CIPSEND over UART) → guard 15s đủ
-    //        Trường hợp tệ nhất: backfill lúc t=44.3s (700ms) → xong t=45s < t=60s realtime ✓
-    //
-    // FIX BUG SPIN: lastBackfillMs phải reset TRƯỚC khi check realtimeImminent
-    // Trước: nếu imminent=true → không reset → loop() re-enter check mỗi ~1ms → spin 15s
-    // Sau:   reset trước → nếu imminent=true → lần sau check sau 15s nữa, không spin
     if (now - lastBackfillMs >= BACKFILL_INTERVAL_MS) {
-        lastBackfillMs = now;  // luôn reset — tránh spin khi realtimeImminent = true
+        lastBackfillMs = now;
         unsigned long elapsed = now - lastPublishMs;
         bool realtimeImminent = (elapsed < PUBLISH_INTERVAL_MS) &&
                                 ((PUBLISH_INTERVAL_MS - elapsed) <= BACKFILL_INTERVAL_MS);

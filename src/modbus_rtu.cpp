@@ -259,6 +259,8 @@ bool modbus_rtu_init() {
     node1.begin(1, BUS1_SERIAL);
     // TD301D485H-A auto-flow: flush echo bytes sau TX, trước khi đọc response
     node1.postTransmission(bus1PostTransmission);
+    // yield CPU khi chờ response — tránh busy-loop trên Core 0 suốt 300ms/channel timeout
+    node1.idle([]() { taskYIELD(); });
     LOG_IF(LOG_MODBUS, "[MODBUS] Bus1 init: %lu 8%c1, %d channels\n",
                   bus1.baud,
                   bus1.parity == 1 ? 'E' : (bus1.parity == 2 ? 'O' : 'N'),

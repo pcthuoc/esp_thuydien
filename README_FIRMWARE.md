@@ -593,3 +593,90 @@ Thất bại (bất kỳ lúc nào):
 | 4 | Rollback | Nếu firmware mới boot lỗi → rollback về partition cũ, báo `failed` |
 | 5 | OTA status gửi trên topic **status** | Cùng topic `station/{device_id}/status`, **không phải** topic cmd |
 | 6 | Kết hợp với status online | Sau reboot, 1 message có cả `"status":"online"` và `"ota_status":"done"` là hợp lệ |
+
+
+
+
+
+---
+
+## Topic 4: `station/{device_id}/cmd`
+
+**Hướng:** Server → Trạm  
+**QoS:** 1  
+**Mục đích:** Server gửi lệnh điều khiển xuống trạm (VD: reset kênh đếm mưa lúc 0h)
+
+### Payload
+
+```json
+{
+  "cmd": "reset_di",
+  "cmd_id": "550e8400-e29b-41d4-a716-446655440000",
+  "channel": "DI1"
+}
+```
+
+| Trường | Kiểu | Bắt buộc | Mô tả |
+|---|---|---|---|
+| `cmd` | string | ✓ | Mã lệnh cần thực hiện (xem bảng lệnh bên dưới) |
+| `cmd_id` | string (UUID v4) | ✓ | ID duy nhất của lệnh — dùng để gửi lại trong `ack` |
+| `channel` | string | Tùy lệnh | Kênh cụ thể cần tác động |
+
+### Bảng lệnh hiện tại
+
+| `cmd` | `channel` | Hành động |
+|---|---|---|
+| `reset_di` | `DI1` | Reset bộ đếm xung kênh DI1 về 0 (reset lượng mưa ngày) |
+
+### Yêu cầu phần cứng
+
+1. **Subscribe** topic `station/{device_id}/cmd` sau khi kết nối MQTT thành công.
+2. Khi nhận được message:
+   - Parse JSON, đọc trường `cmd`.
+   - Thực hiện hành động tương ứng (VD: `reset_di` → ghi DI1 = 0).
+   - Gửi lại ack về topic `station/{device_id}/ack` với đúng `cmd_id` đã nhận.
+3. Nếu không gửi ack trong **60 giây**, server sẽ gửi lại lệnh. Server retry tối đa **5 lần**.
+
+---
+
+## Topic 5: `station/{device_id}/ack`
+
+**Hướng:** Trạm → Server  
+**QoS:** 1  
+**Mục đích:** Trạm xác nhận đã thực hiện xong lệnh từ server
+
+### Payload
+
+```json
+{
+  "ack": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "ok"
+}
+```
+
+| Trường | Kiểu | Bắt buộc | Mô tả |
+|---|---|---|---|
+| `ack` | string (UUID v4) | ✓ | Sao chép nguyên `cmd_id` nhận từ lệnh |
+| `status` | string | ✓ | Kết quả thực hiện: `"ok"` (hiện tại chỉ chấp nhận `"ok"`) |
+
+### Luồng hoàn chỉnh (cmd → ack)
+
+```
+Server                              Trạm (Firmware)
+  │                                     │
+  │── CMD  topic: .../cmd ──────────────►│
+  │   {cmd, cmd_id, channel}             │
+  │                                      │  (thực hiện lệnh)
+  │◄─ ACK  topic: .../ack ──────────────│
+  │   {ack: <cmd_id>, status: "ok"}      │
+  │                                     │
+  │  [nếu không nhận ack trong 60s]      │
+  │── CMD retry (tối đa 5 lần) ─────────►│
+```
+
+### Lưu ý quan trọng
+
+- Trường `ack` trong payload phải là **chính xác** giá trị `cmd_id` nhận được — server dùng UUID này để tra cứu.
+- Nếu sau 5 lần retry vẫn không có ack, server sẽ tạo cảnh báo (notification) và **không gửi thêm**.
+- Trạm chỉ cần **Publish** topic `.../ack`. Server không publish lên topic này.
+

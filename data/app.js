@@ -543,13 +543,13 @@ async function saveEncoder() {
 // ============================================================
 async function pageDi() {
     const cfg = await apiGetConfig('/api/config/di');
-    const ch = (cfg.channels || {}).DI1 || {};
+    const ch = (cfg.channels || {}).DI4 || {};
 
     content.innerHTML = `
-        <h2>🌧 Cấu hình Cảm biến mưa (DI1)</h2>
+        <h2>🌧 Cấu hình Cảm biến mưa (DI4)</h2>
         <div class="card">
             <div class="form-group">
-                <label><input type="checkbox" id="di_enabled" ${ch.enabled ? 'checked' : ''}> Kích hoạt DI1</label>
+                <label><input type="checkbox" id="di_enabled" ${ch.enabled ? 'checked' : ''}> Kích hoạt DI4</label>
             </div>
             <div class="form-row">
                 <div class="form-group">
@@ -591,7 +591,7 @@ async function pageDi() {
 }
 
 function updateDiDebug(d) {
-    const raw = d.DI1 ?? null;
+    const raw = d.DI4 ?? null;
     const rawEl = $('#di_debug_raw');
     const realEl = $('#di_debug_real');
     if (!rawEl) return;
@@ -612,7 +612,7 @@ function updateDiDebug(d) {
 async function saveDi() {
     const data = {
         channels: {
-            DI1: {
+            DI4: {
                 enabled: $('#di_enabled').checked,
                 calc_mode: $('#di_calc').value,
                 weight: parseFloat($('#di_weight').value) || null,

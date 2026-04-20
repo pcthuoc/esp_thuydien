@@ -14,9 +14,14 @@
 bool modem_4g_init(const char* apn, const char* pin = nullptr);
 
 // Trạng thái kết nối GPRS
+// Đọc volatile flag — KHÔNG gọi AT command, safe từ bất kỳ core nào.
+// Flag được cập nhật bởi modem_4g_init(), modem_4g_reconnect(), và net4g_task.
 bool modem_4g_is_connected();
 
-// Thử reconnect khi mất kết nối
+// Cập nhật GPRS connection flag (gọi từ net4g_task sau khi reconnect thành công/thất bại)
+void modem_4g_set_gprs_flag(bool connected);
+
+// Thử reconnect khi mất kết nối (blocking AT — chỉ gọi từ net4g_task Core 0)
 bool modem_4g_reconnect();
 
 // Thông tin modem

@@ -200,7 +200,7 @@ static void api_debug_raw(AsyncWebServerRequest* request) {
         doc["E1"] = counter_get(0);
         doc["E2"] = counter_get(1);
     } else if (group == "di") {
-        doc["DI1"] = rain_get_count();
+        doc["DI4"] = rain_get_count();
     } else if (group == "rs485") {
         modbus_rtu_poll();
         uint8_t n = modbus_rtu_channel_count();

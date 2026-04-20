@@ -39,3 +39,7 @@ void mqtt_set_config_callback_simple(void (*cb)());
 
 // Gọi mqtt.loop() để giữ kết nối (dùng trong OTA)
 void mqtt_keep_alive();
+
+// Forward received message vào callback chain (topic/payload từ net4g rx queue)
+// Gọi trên Core 1 từ mqtt_update() — dùng bởi net4g_task_start()
+void mqttCallback_public(const char* topic, const byte* payload, unsigned int len);

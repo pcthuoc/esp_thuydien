@@ -1,4 +1,5 @@
 #include "mqtt_client.h"
+#include "net4g_task.h"
 #include "sd_card.h"
 #include "debug_config.h"
 #include "led_status.h"
@@ -7,6 +8,7 @@
 #include "ota_update.h"
 #include "error_log.h"
 #include "modem_4g.h"
+#include "rain_gauge.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <PubSubClient.h>
@@ -31,6 +33,7 @@ static String topic_data;
 static String topic_status;
 static String topic_config;
 static String topic_cmd;
+static String topic_ack;
 
 // Reconnect timing
 static unsigned long lastReconnectAttempt = 0;
@@ -250,6 +253,22 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
                     LOG_IF(LOG_MQTT, "[MQTT] CMD set_mqtt: %s:%d -> saved\n", host, port);
                     String ack = "{\"cmd\":\"set_mqtt\",\"ack\":true,\"host\":\"" + String(host) + "\",\"port\":" + String(port) + ",\"ts\":\"" + ntp_rtc_get_datetime() + "\"}";
                     mqtt.publish(topic_status.c_str(), ack.c_str(), false);
+                }
+            }
+            else if (strcmp(cmd, "reset_di") == 0) {
+                const char* channel  = doc["channel"] | "DI4";
+                const char* cmd_id   = doc["cmd_id"]  | "";
+                LOG_IF(LOG_MQTT, "[MQTT] CMD reset_di: channel=%s cmd_id=%s\n", channel, cmd_id);
+                if (strcmp(channel, "DI4") == 0) {
+                    rain_reset();
+                    // Gửi ack về topic .../ack theo spec
+                    if (strlen(cmd_id) > 0) {
+                        String ack = "{\"ack\":\"" + String(cmd_id) + "\",\"status\":\"ok\"}";
+                        mqtt.publish(topic_ack.c_str(), ack.c_str(), false);
+                        LOG_IF(LOG_MQTT, "[MQTT] ACK sent: %s\n", ack.c_str());
+                    }
+                } else {
+                    LOG_IF(LOG_MQTT, "[MQTT] reset_di: channel không hỗ trợ: %s\n", channel);
                 }
             }
             else if (strcmp(cmd, "ota_update") == 0) {
@@ -482,6 +501,11 @@ static String buildDeviceConfig() {
 
 // Publish payload lớn bằng streaming (vượt buffer limit)
 static bool mqttPublishLarge(const char* topic, const String& payload) {
+    // 4G mode: ủy thác hoàn toàn cho net4g_task (Serial1 thuộc về Core 0)
+    if (net4g_is_active()) {
+        return net4g_publish_large(topic, payload);
+    }
+    // WiFi mode: streaming qua WiFiClient (thread-safe, chạy trực tiếp trên Core 1)
     if (!mqtt.beginPublish(topic, payload.length(), false)) {
         LOG_IF(LOG_MQTT, "[MQTT] beginPublish FAILED for %s\n", topic);
         return false;
@@ -552,6 +576,7 @@ bool mqtt_init() {
     topic_status = "station/" + cfg_device_id + "/status";
     topic_config = "station/" + cfg_device_id + "/config";
     topic_cmd    = "station/" + cfg_device_id + "/cmd";
+    topic_ack    = "station/" + cfg_device_id + "/ack";
 
     // PubSubClient buffer mặc định 256 bytes — tăng lên 4KB
     mqtt.setBufferSize(4096);
@@ -572,9 +597,93 @@ static bool _wasMqttConnected = false;
 static unsigned long s_lastConfigPublishMs = 0;
 #define CONFIG_PUBLISH_COOLDOWN_MS  300000UL  // 5 phút
 
+// Helper dùng chung: xử lý justConnected (gửi online status + device config)
+// Gọi cả từ WiFi path lẫn 4G path. Publish thông qua mqtt_publish_* / mqttPublishLarge
+// → tự động dispatch đúng transport (WiFiClient hoặc net4g_task queue).
+static void handleJustConnected() {
+    led_set_state(LedState::ONLINE_OK);
+
+    JsonDocument statusDoc;
+    statusDoc["status"]     = "online";
+    statusDoc["ts"]         = ntp_rtc_get_datetime();
+    statusDoc["mqtt_host"]  = cfg_broker;
+    statusDoc["mqtt_port"]  = cfg_port;
+    statusDoc["fw_version"] = FW_VERSION;
+    if (WiFi.status() == WL_CONNECTED) {
+        statusDoc["net_mode"] = "wifi";
+        statusDoc["ip"]       = WiFi.localIP().toString();
+    } else {
+        statusDoc["net_mode"] = "4g";
+        statusDoc["ip"]       = modem_4g_ip();
+        statusDoc["rssi"]     = modem_4g_rssi();
+        statusDoc["operator"] = modem_4g_operator();
+    }
+    if (ota_check_just_updated()) {
+        statusDoc["ota_status"]   = "done";
+        statusDoc["ota_progress"] = 100;
+    }
+
+    String statusMsg;
+    serializeJson(statusDoc, statusMsg);
+    mqtt_publish_status(statusMsg);
+    LOGLN_IF(LOG_MQTT, "[MQTT] Published: online status");
+
+    // Publish device config (streaming)
+    // Cooldown 5 phút: tránh gọi liên tục khi 4G reconnect bão
+    unsigned long nowMs = millis();
+    if (nowMs - s_lastConfigPublishMs >= CONFIG_PUBLISH_COOLDOWN_MS) {
+        s_lastConfigPublishMs = nowMs;
+        String cfgMsg = buildDeviceConfig();
+        if (!mqttPublishLarge(topic_config.c_str(), cfgMsg)) {
+            LOGLN_IF(LOG_MQTT, "[MQTT] Config publish FAIL (transport limit?)");
+            err_log("MQTT", "Config publish FAIL on connect");
+        }
+    } else {
+        LOG_IF(LOG_MQTT, "[MQTT] Config publish skipped (cooldown %lus remaining)\n",
+               (CONFIG_PUBLISH_COOLDOWN_MS - (nowMs - s_lastConfigPublishMs)) / 1000);
+    }
+}
+
 void mqtt_update() {
-    // Cho phép chạy cả khi WiFi không có (4G mode dùng TinyGsmClient)
-    bool hasNetwork = (WiFi.status() == WL_CONNECTED) || modem_4g_is_connected();
+    // ── 4G mode: net4g_task (Core 0) xử lý toàn bộ Serial1/MQTT transport ──────
+    // Core 1 chỉ đọc flag, xử lý rx queue, và gửi publish qua net4g API.
+    if (net4g_is_active()) {
+        // Just-connected edge: net4g_task báo kết nối mới thành công
+        if (net4g_just_connected()) {
+            justConnected = true;
+            _wasMqttConnected = false;  // reset để log disconnect sau này
+        }
+
+        bool connected4g = net4g_mqtt_connected();
+
+        if (!connected4g && _wasMqttConnected) {
+            _wasMqttConnected = false;
+            err_log("MQTT", "4G MQTT disconnected");
+        }
+
+        if (connected4g) {
+            _wasMqttConnected = true;
+            led_set_state(LedState::ONLINE_OK);
+
+            if (justConnected) {
+                justConnected = false;
+                handleJustConnected();
+            }
+
+            // Xử lý received messages từ net4g rx queue (chạy trên Core 1 — safe)
+            MqttRxMsg rxMsg;
+            while (net4g_poll_rx(&rxMsg)) {
+                mqttCallback(rxMsg.topic, rxMsg.payload, rxMsg.len);
+            }
+        } else {
+            if (led_get_state() == LedState::ONLINE_OK)
+                led_set_state(LedState::MQTT_CONNECTING);
+        }
+        return;
+    }
+
+    // ── WiFi mode: PubSubClient chạy trực tiếp trên Core 1 (WiFiClient thread-safe) ──
+    bool hasNetwork = (WiFi.status() == WL_CONNECTED);
     if (!hasNetwork) return;
 
     if (!mqtt.connected()) {
@@ -595,64 +704,24 @@ void mqtt_update() {
         _wasMqttConnected = true;
         mqtt.loop();
 
-        // Sau khi vừa kết nối: gửi online + config
         if (justConnected) {
             justConnected = false;
-            led_set_state(LedState::ONLINE_OK);
-
-            // Publish online status (mở rộng)
-            JsonDocument statusDoc;
-            statusDoc["status"] = "online";
-            statusDoc["ts"] = ntp_rtc_get_datetime();
-            statusDoc["mqtt_host"] = cfg_broker;
-            statusDoc["mqtt_port"] = cfg_port;
-            statusDoc["fw_version"] = FW_VERSION;
-            if (WiFi.status() == WL_CONNECTED) {
-                statusDoc["net_mode"] = "wifi";
-                statusDoc["ip"] = WiFi.localIP().toString();
-            } else {
-                statusDoc["net_mode"] = "4g";
-                statusDoc["ip"] = modem_4g_ip();
-                statusDoc["rssi"] = modem_4g_rssi();
-                statusDoc["operator"] = modem_4g_operator();
-            }
-
-            // Nếu vừa OTA xong → thêm ota_status done
-            if (ota_check_just_updated()) {
-                statusDoc["ota_status"]   = "done";
-                statusDoc["ota_progress"] = 100;
-            }
-
-            String statusMsg;
-            serializeJson(statusDoc, statusMsg);
-            mqtt.publish(topic_status.c_str(), statusMsg.c_str(), false);
-            LOGLN_IF(LOG_MQTT, "[MQTT] Published: online status");
-
-            // Publish device config (streaming — không giới hạn bởi buffer)
-            // Cooldown 5 phút: tránh đọc 5 file SD + 6 JsonDoc đồng thời khi 4G reconnect bão
-            unsigned long nowMs = millis();
-            if (nowMs - s_lastConfigPublishMs >= CONFIG_PUBLISH_COOLDOWN_MS) {
-                s_lastConfigPublishMs = nowMs;
-                String cfgMsg = buildDeviceConfig();
-                if (!mqttPublishLarge(topic_config.c_str(), cfgMsg)) {
-                    // Config fail (thường gặp trên 4G khi payload > 1460 bytes/AT+CIPSEND)
-                    // Không force disconnect — để keepalive phát hiện trạng thái TCP tự nhiên
-                    LOGLN_IF(LOG_MQTT, "[MQTT] Config publish FAIL (transport limit?)");
-                    err_log("MQTT", "Config publish FAIL on connect");
-                }
-            } else {
-                LOG_IF(LOG_MQTT, "[MQTT] Config publish skipped (cooldown %lus remaining)\n",
-                       (CONFIG_PUBLISH_COOLDOWN_MS - (nowMs - s_lastConfigPublishMs)) / 1000);
-            }
+            handleJustConnected();
         }
     }
 }
 
 bool mqtt_is_connected() {
+    if (net4g_is_active()) return net4g_mqtt_connected();
     return mqtt.connected();
 }
 
 bool mqtt_publish_data(const String& json) {
+    if (net4g_is_active()) {
+        bool ok = net4g_publish(topic_data.c_str(), json);
+        if (!ok) err_log("MQTT", "publish_data FAIL (4G)");
+        return ok;
+    }
     if (!mqtt.connected()) {
         LOGLN_IF(LOG_MQTT, "[MQTT] publish_data FAILED: not connected");
         return false;
@@ -669,6 +738,9 @@ bool mqtt_publish_data(const String& json) {
 }
 
 bool mqtt_publish_status(const String& json) {
+    if (net4g_is_active()) {
+        return net4g_publish(topic_status.c_str(), json);
+    }
     if (!mqtt.connected()) {
         LOGLN_IF(LOG_MQTT, "[MQTT] publish_status FAILED: not connected");
         return false;
@@ -679,6 +751,9 @@ bool mqtt_publish_status(const String& json) {
 }
 
 bool mqtt_publish_config(const String& json) {
+    if (net4g_is_active()) {
+        return net4g_publish(topic_config.c_str(), json);
+    }
     if (!mqtt.connected()) {
         LOGLN_IF(LOG_MQTT, "[MQTT] publish_config FAILED: not connected");
         return false;
@@ -697,7 +772,14 @@ void mqtt_set_config_callback_simple(void (*cb)()) {
 }
 
 void mqtt_keep_alive() {
+    // 4G mode: net4g_task chạy mqtt4g.loop() mội 10ms — không cần gọi thêm
+    if (net4g_is_active()) return;
     if (mqtt.connected()) {
         mqtt.loop();
     }
+}
+// Wrapper public cho mqttCallback — được gọi từ mqtt_update() (Core 1)
+// khi xử lý rx queue từ net4g_task
+void mqttCallback_public(const char* topic, const byte* payload, unsigned int len) {
+    mqttCallback(const_cast<char*>(topic), const_cast<byte*>(payload), len);
 }

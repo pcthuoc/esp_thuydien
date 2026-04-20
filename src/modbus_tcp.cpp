@@ -16,8 +16,9 @@
 // ETH_RST không nối — W5500 dùng internal power-on reset
 
 // Timeout khi đọc Modbus TCP (ms)
-#define TCP_CONNECT_TIMEOUT  1000
-#define TCP_READ_TIMEOUT     1000
+// 400ms đủ cho mạng LAN cục bộ, tránh worst-case 2s/channel khi slave offline
+#define TCP_CONNECT_TIMEOUT  500
+#define TCP_READ_TIMEOUT     400
 
 // ============================================================
 // State
@@ -100,7 +101,7 @@ static bool readBytes(EthernetClient& client, uint8_t* buf, size_t n) {
     while (got < n) {
         if (millis() - start > (uint32_t)TCP_READ_TIMEOUT) return false;
         if (client.available()) buf[got++] = client.read();
-        else taskYIELD();  // nhường CPU khi chưa có data — cho btn_task chạy đúng 10ms tick
+        else vTaskDelay(pdMS_TO_TICKS(1));  // sleep 1ms — tránh busy-spin Core 0 suốt timeout
     }
     return true;
 }
